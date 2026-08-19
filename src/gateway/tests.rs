@@ -4116,7 +4116,7 @@ async fn run_to_timeout(
     gateway
         .tick_fake(vec![message(1, "me@icloud.com", "", true, "slow")])
         .await;
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if !gateway.ctx.sent_replies.lock().unwrap().is_empty() {
                 break;
@@ -4189,6 +4189,22 @@ async fn timeout_hook_failure_falls_back() {
     assert!(replies
         .iter()
         .any(|(_, reply)| reply.contains("That took too long and was stopped")));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn timeout_hook_overrun_falls_back() {
+    // The hook sleeps past the 5s budget; the reply must still be delivered.
+    let cli = crate::test_support::FakeCli::new("hook-slow", "#!/bin/sh\nsleep 30\n");
+    let started = std::time::Instant::now();
+    let (replies, _) = run_to_timeout("timeout-hook-slow", &|cfg| {
+        cfg.timeout_reply = Some("custom timeout text".to_string());
+        cfg.timeout_hook = Some(cli.bin());
+    })
+    .await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(15));
+    assert!(replies
+        .iter()
+        .any(|(_, reply)| reply.contains("custom timeout text")));
 }
 
 #[tokio::test(flavor = "current_thread")]
