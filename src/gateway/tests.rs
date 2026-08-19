@@ -3956,6 +3956,8 @@ async fn retired_job_approval_reply_explains_direct_creation() {
 
 fn test_config(state_path: &str, _sessions_dir: &str, assistant_dir: &str) -> Config {
     Config {
+        timeout_reply: None,
+        timeout_hook: None,
         channel: "imessage".to_string(),
         channels: Vec::new(),
         primary_delivery: None,
@@ -4081,6 +4083,135 @@ fn approval_question(
         now_ms() + 60_000,
     )
     .unwrap()
+}
+
+/// Runs one message against a never-released FakeRunner so the gateway times
+/// the run out, then returns the delivered replies and the canonical work dir.
+async fn run_to_timeout(
+    state_tag: &str,
+    mutate_cfg: &dyn Fn(&mut Config),
+) -> (Vec<(String, String)>, String) {
+    let state_path = temp_path(&format!("{state_tag}-state"));
+    let state = state_path.to_string_lossy().to_string();
+    let assistant_dir = temp_path(&format!("{state_tag}-assistant"));
+    std::fs::create_dir_all(&assistant_dir).unwrap();
+    let mut cfg = test_config(&state, "", &assistant_dir.to_string_lossy());
+    mutate_cfg(&mut cfg);
+    let mut gateway = Gateway::new(cfg).unwrap();
+    let mut runners = HashMap::new();
+    runners.insert(
+        AgentBackend::Codex,
+        Runner::Fake(FakeRunner {
+            backend: AgentBackend::Codex,
+            session_id: "fake-session".to_string(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            before_return: None,
+            wait_for_release: Some(Arc::new(tokio::sync::Notify::new())),
+            failure: None,
+            resume_missing_once: None,
+        }),
+    );
+    gateway.ctx.runners = Arc::new(runners);
+    gateway.ctx.run_timeout = Duration::from_millis(100);
+    gateway
+        .tick_fake(vec![message(1, "me@icloud.com", "", true, "slow")])
+        .await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if !gateway.ctx.sent_replies.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("timeout reply should be delivered");
+    let work_dir = std::fs::canonicalize(&assistant_dir)
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    gateway.queues.clear();
+    gateway.drain_workers().await;
+    let replies = gateway.ctx.sent_replies.lock().unwrap().clone();
+    let _ = std::fs::remove_dir_all(&assistant_dir);
+    let _ = std::fs::remove_dir_all(format!("{state}.cache"));
+    let _ = std::fs::remove_dir_all(format!("{state}.jobs"));
+    let _ = std::fs::remove_dir_all(format!("{state}.run"));
+    for suffix in ["", ".db", ".audit.jsonl", ".audit.jsonl.lock", ".home"] {
+        let _ = std::fs::remove_file(format!("{state}{suffix}"));
+    }
+    (replies, work_dir)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn timeout_uses_custom_reply() {
+    let (replies, _) = run_to_timeout("timeout-custom", &|cfg| {
+        cfg.timeout_reply = Some("custom timeout text".to_string());
+    })
+    .await;
+    assert!(replies
+        .iter()
+        .any(|(_, reply)| reply.contains("custom timeout text")));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn timeout_hook_stdout_wins() {
+    let cli = crate::test_support::FakeCli::new("hook-wins", "#!/bin/sh\necho hook says hi\n");
+    let (replies, _) = run_to_timeout("timeout-hook", &|cfg| {
+        cfg.timeout_reply = Some("custom timeout text".to_string());
+        cfg.timeout_hook = Some(cli.bin());
+    })
+    .await;
+    assert!(replies
+        .iter()
+        .any(|(_, reply)| reply.contains("hook says hi")));
+    assert!(!replies
+        .iter()
+        .any(|(_, reply)| reply.contains("custom timeout text")));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn timeout_hook_failure_falls_back() {
+    let cli = crate::test_support::FakeCli::new("hook-fail", "#!/bin/sh\nexit 1\n");
+    let (replies, _) = run_to_timeout("timeout-hook-fail", &|cfg| {
+        cfg.timeout_reply = Some("custom timeout text".to_string());
+        cfg.timeout_hook = Some(cli.bin());
+    })
+    .await;
+    assert!(replies
+        .iter()
+        .any(|(_, reply)| reply.contains("custom timeout text")));
+
+    let (replies, _) = run_to_timeout("timeout-hook-fail-default", &|cfg| {
+        cfg.timeout_hook = Some(cli.bin());
+    })
+    .await;
+    assert!(replies
+        .iter()
+        .any(|(_, reply)| reply.contains("That took too long and was stopped")));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn timeout_hook_receives_env_vars() {
+    let env_path = temp_path("hook-env");
+    let script = format!(
+        "#!/bin/sh\nenv | grep '^PUSH_' > '{}'\necho ok\n",
+        env_path.to_string_lossy()
+    );
+    let cli = crate::test_support::FakeCli::new("hook-env", &script);
+    let (replies, work_dir) = run_to_timeout("timeout-hook-env", &|cfg| {
+        cfg.timeout_hook = Some(cli.bin());
+    })
+    .await;
+    assert!(replies.iter().any(|(_, reply)| reply.contains("ok")));
+    let env = std::fs::read_to_string(&env_path).unwrap();
+    let _ = std::fs::remove_file(&env_path);
+    assert!(env
+        .lines()
+        .any(|line| line.starts_with("PUSH_THREAD=imessage:")));
+    assert!(env.contains("PUSH_ROW_ID=1"));
+    assert!(env.contains("PUSH_BACKEND=codex"));
+    assert!(env.contains(&format!("PUSH_WORK_DIR={work_dir}")));
 }
 
 fn message(row_id: i64, chat: &str, handle: &str, is_from_me: bool, text: &str) -> RawMessage {

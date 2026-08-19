@@ -468,11 +468,11 @@ where
                     format!("{} run timed out", runner.label()),
                 ),
             );
-            let reply = "That took too long and was stopped. Try again or simplify the request.";
+            let reply = timeout_reply(ctx, &job, &work_dir).await;
             finish_run_with_gateway_reply(
                 ctx,
                 &job,
-                reply,
+                &reply,
                 ReplyLabels {
                     record: "record timeout reply",
                     deliver: "deliver timeout reply",
@@ -696,6 +696,48 @@ struct ReplyLabels {
     record: &'static str,
     deliver: &'static str,
     completion: &'static str,
+}
+
+const DEFAULT_TIMEOUT_REPLY: &str =
+    "That took too long and was stopped. Try again or simplify the request.";
+
+/// Resolves the reply for a timed-out run: hook stdout (trimmed) wins, then
+/// `timeout_reply`, then the default. Hook problems never lose the message.
+async fn timeout_reply(ctx: &Ctx, job: &Job, work_dir: &str) -> String {
+    let mut reply = ctx
+        .cfg
+        .timeout_reply
+        .clone()
+        .unwrap_or_else(|| DEFAULT_TIMEOUT_REPLY.to_string());
+    let Some(hook) = ctx.cfg.timeout_hook.clone() else {
+        return reply;
+    };
+    let spawned = tokio::process::Command::new(&hook)
+        .env("PUSH_THREAD", &job.thread)
+        .env("PUSH_ROW_ID", job.row_id.to_string())
+        .env("PUSH_BACKEND", job.backend.as_str())
+        .env("PUSH_WORK_DIR", work_dir)
+        .output();
+    match tokio::time::timeout(Duration::from_secs(5), spawned).await {
+        Ok(Ok(output)) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if stdout.is_empty() {
+                warn!("[{}] timeout hook produced no output", job.thread);
+            } else {
+                reply = stdout;
+            }
+        }
+        Ok(Ok(output)) => warn!(
+            "[{}] timeout hook exited with {}: using fallback reply",
+            job.thread, output.status
+        ),
+        Ok(Err(error)) => warn!("[{}] timeout hook failed to run: {error}", job.thread),
+        Err(_) => warn!(
+            "[{}] timeout hook exceeded 5s: using fallback reply",
+            job.thread
+        ),
+    }
+    reply
 }
 
 /// Records a gateway-authored reply, delivers it, and completes the row.
