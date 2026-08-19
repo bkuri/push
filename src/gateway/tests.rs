@@ -4103,6 +4103,14 @@ async fn run_to_timeout(
     state_tag: &str,
     mutate_cfg: &dyn Fn(&mut Config),
 ) -> (Vec<(String, String)>, String) {
+    run_to_timeout_with_info(state_tag, mutate_cfg, TimeoutInfo::default()).await
+}
+
+async fn run_to_timeout_with_info(
+    state_tag: &str,
+    mutate_cfg: &dyn Fn(&mut Config),
+    info: TimeoutInfo,
+) -> (Vec<(String, String)>, String) {
     let state_path = temp_path(&format!("{state_tag}-state"));
     let state = state_path.to_string_lossy().to_string();
     let assistant_dir = temp_path(&format!("{state_tag}-assistant"));
@@ -4121,7 +4129,7 @@ async fn run_to_timeout(
             wait_for_release: Some(Arc::new(tokio::sync::Notify::new())),
             failure: None,
             resume_missing_once: None,
-            timeout_info: TimeoutInfo::default(),
+            timeout_info: info,
         }),
     );
     gateway.ctx.runners = Arc::new(runners);
@@ -4333,9 +4341,16 @@ async fn timeout_hook_receives_env_vars() {
         env_path.to_string_lossy()
     );
     let cli = crate::test_support::FakeCli::new("hook-env", &script);
-    let (replies, work_dir) = run_to_timeout("timeout-hook-env", &|cfg| {
-        cfg.timeout_hook = Some(cli.bin());
-    })
+    let (replies, work_dir) = run_to_timeout_with_info(
+        "timeout-hook-env",
+        &|cfg| {
+            cfg.timeout_hook = Some(cli.bin());
+        },
+        TimeoutInfo {
+            session_id: Some("hook-session".to_string()),
+            progress: None,
+        },
+    )
     .await;
     assert!(replies.iter().any(|(_, reply)| reply.contains("ok")));
     let env = std::fs::read_to_string(&env_path).unwrap();
@@ -4346,6 +4361,7 @@ async fn timeout_hook_receives_env_vars() {
     assert!(env.contains("PUSH_ROW_ID=1"));
     assert!(env.contains("PUSH_BACKEND=codex"));
     assert!(env.contains(&format!("PUSH_WORK_DIR={work_dir}")));
+    assert!(env.contains("PUSH_SESSION_ID=hook-session"));
 }
 
 #[tokio::test(flavor = "current_thread")]
