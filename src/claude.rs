@@ -98,7 +98,7 @@ impl Runner {
             }
         });
         let out = match tokio::time::timeout(timeout, attempt).await {
-            Err(_) => return Err(RunError::Timeout),
+            Err(_) => return Err(RunError::Timeout(crate::agent::TimeoutInfo::default())),
             Ok(Err(e)) => return Err(RunError::Failed(format!("spawn claude: {e}"))),
             Ok(Ok(o)) => o,
         };
@@ -919,14 +919,14 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"d
     fn assert_failed(err: RunError, expected: &str) {
         match err {
             RunError::Failed(msg) => assert_eq!(msg, expected),
-            RunError::Timeout => panic!("expected failed error, got timeout"),
+            RunError::Timeout(_) => panic!("expected failed error, got timeout"),
             RunError::SessionMissing(msg) => panic!("unexpected missing session: {msg}"),
         }
     }
 
     fn assert_timeout(err: RunError) {
         match err {
-            RunError::Timeout => {}
+            RunError::Timeout(_) => {}
             RunError::Failed(msg) => panic!("expected timeout, got failed: {msg}"),
             RunError::SessionMissing(msg) => panic!("unexpected missing session: {msg}"),
         }

@@ -2971,7 +2971,7 @@ failure precisely. End with exactly one final line: VERDICT: PASS or VERDICT: FA
     };
     match runner.run_evaluator(request, job.timeout).await {
         Ok(output) => evaluation_from_reply(output.reply),
-        Err(RunError::Timeout) => EvaluationOutcome {
+        Err(RunError::Timeout(_)) => EvaluationOutcome {
             state: "error",
             result: None,
             error: Some("evaluator timed out".to_string()),
@@ -3052,7 +3052,7 @@ async fn execute(cfg: &Config, job: &Job) -> std::result::Result<String, Executi
         .await
     {
         Ok(output) => Ok(output.reply),
-        Err(RunError::Timeout) => Err(ExecutionError::Timeout),
+        Err(RunError::Timeout(_)) => Err(ExecutionError::Timeout),
         Err(RunError::Failed(error) | RunError::SessionMissing(error)) => {
             Err(ExecutionError::Failed(format!("backend: {error}")))
         }

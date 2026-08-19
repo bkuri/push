@@ -1,6 +1,6 @@
 use super::worker::{handle, run_with_periodic_activity, SESSION_SETUP_FAILURE};
 use super::*;
-use crate::agent::{FakeRunCall, FakeRunner};
+use crate::agent::{FakeRunCall, FakeRunner, TimeoutInfo};
 use crate::approval::Question;
 use crate::channel::{normalize_handle, thread_handle, InboundImage, InboundVoice};
 use crate::history::DeliveryStatus;
@@ -1074,6 +1074,7 @@ async fn missing_backend_session_rotates_and_rehydrates_once() {
             wait_for_release: None,
             failure: None,
             resume_missing_once: Some(missing),
+            timeout_info: TimeoutInfo::default(),
         }),
     );
     gateway.ctx.runners = Arc::new(runners);
@@ -1158,6 +1159,7 @@ async fn backend_switch_and_clear_start_fresh_sessions_with_history() {
             wait_for_release: None,
             failure: None,
             resume_missing_once: None,
+            timeout_info: TimeoutInfo::default(),
         }),
     );
     runners.insert(
@@ -1170,6 +1172,7 @@ async fn backend_switch_and_clear_start_fresh_sessions_with_history() {
             wait_for_release: None,
             failure: None,
             resume_missing_once: None,
+            timeout_info: TimeoutInfo::default(),
         }),
     );
     gateway.ctx.runners = Arc::new(runners);
@@ -1884,6 +1887,7 @@ async fn slack_images_reach_every_agent_backend_and_are_removed_after_each_turn(
                 wait_for_release: None,
                 failure: None,
                 resume_missing_once: None,
+                timeout_info: TimeoutInfo::default(),
             }),
         )]));
 
@@ -1943,6 +1947,7 @@ async fn imessage_images_reach_every_agent_backend_and_are_removed_after_each_tu
                 wait_for_release: None,
                 failure: None,
                 resume_missing_once: None,
+                timeout_info: TimeoutInfo::default(),
             }),
         )]));
         let mut inbound = message(1, "+15551234567", "+15551234567", false, "");
@@ -2473,6 +2478,7 @@ async fn telegram_image_only_and_captioned_messages_reach_pi() {
             wait_for_release: None,
             failure: None,
             resume_missing_once: None,
+            timeout_info: TimeoutInfo::default(),
         }),
     )]));
 
@@ -2633,6 +2639,7 @@ async fn telegram_image_reaches_claude_and_is_removed_after_the_turn() {
             wait_for_release: None,
             failure: None,
             resume_missing_once: None,
+            timeout_info: TimeoutInfo::default(),
         }),
     )]));
     run_messages(
@@ -2872,6 +2879,7 @@ async fn stop_interrupts_active_run_and_preserves_queued_messages() {
             wait_for_release: Some(release.clone()),
             failure: None,
             resume_missing_once: None,
+            timeout_info: TimeoutInfo::default(),
         }),
     );
     gateway.ctx.runners = Arc::new(runners);
@@ -2981,6 +2989,7 @@ async fn stop_interrupts_a_worker_queued_in_the_same_poll_batch() {
             wait_for_release: Some(release.clone()),
             failure: None,
             resume_missing_once: None,
+            timeout_info: TimeoutInfo::default(),
         }),
     );
     gateway.ctx.runners = Arc::new(runners);
@@ -3248,6 +3257,7 @@ async fn retried_stop_acknowledgement_does_not_cancel_the_next_request() {
             wait_for_release: Some(release.clone()),
             failure: None,
             resume_missing_once: None,
+            timeout_info: TimeoutInfo::default(),
         }),
     );
     gateway.ctx.runners = Arc::new(runners);
@@ -3313,6 +3323,7 @@ async fn retried_stop_acknowledgement_does_not_cancel_the_next_request() {
             wait_for_release: Some(restart_release.clone()),
             failure: None,
             resume_missing_once: None,
+            timeout_info: TimeoutInfo::default(),
         }),
     );
     restarted.ctx.runners = Arc::new(restart_runners);
@@ -4037,6 +4048,7 @@ fn fake_runners_with_hook(
             wait_for_release: None,
             failure: None,
             resume_missing_once: None,
+            timeout_info: TimeoutInfo::default(),
         }),
     );
     runners
@@ -4109,6 +4121,7 @@ async fn run_to_timeout(
             wait_for_release: Some(Arc::new(tokio::sync::Notify::new())),
             failure: None,
             resume_missing_once: None,
+            timeout_info: TimeoutInfo::default(),
         }),
     );
     gateway.ctx.runners = Arc::new(runners);
@@ -4152,6 +4165,64 @@ async fn timeout_uses_custom_reply() {
     assert!(replies
         .iter()
         .any(|(_, reply)| reply.contains("custom timeout text")));
+    assert!(!replies
+        .iter()
+        .any(|(_, reply)| reply.contains("Last progress")));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn timeout_reply_includes_progress_and_followup() {
+    let state_path = temp_path("timeout-progress-state");
+    let state = state_path.to_string_lossy().to_string();
+    let assistant_dir = temp_path("timeout-progress-assistant");
+    std::fs::create_dir_all(&assistant_dir).unwrap();
+    std::fs::write(
+        assistant_dir.join("PROGRESS.md"),
+        "- imported the data\n- installed dependencies\n\n- wrote the auth module\n- started the test suite\n",
+    )
+    .unwrap();
+    let mut gateway =
+        Gateway::new(test_config(&state, "", &assistant_dir.to_string_lossy())).unwrap();
+    let mut runners = HashMap::new();
+    runners.insert(
+        AgentBackend::Codex,
+        Runner::Fake(FakeRunner {
+            backend: AgentBackend::Codex,
+            session_id: "fake-session".to_string(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            before_return: None,
+            wait_for_release: Some(Arc::new(tokio::sync::Notify::new())),
+            failure: None,
+            resume_missing_once: None,
+            timeout_info: TimeoutInfo::default(),
+        }),
+    );
+    gateway.ctx.runners = Arc::new(runners);
+    gateway.ctx.run_timeout = Duration::from_millis(100);
+    gateway
+        .tick_fake(vec![message(1, "me@icloud.com", "", true, "slow")])
+        .await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if !gateway.ctx.sent_replies.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("timeout reply should be delivered");
+    gateway.queues.clear();
+    gateway.drain_workers().await;
+    let replies = gateway.ctx.sent_replies.lock().unwrap().clone();
+    let reply = &replies[0].1;
+    assert!(reply.contains("That took too long and was stopped."));
+    // Only the last three checkpoints, in order, skipping blank lines.
+    assert!(reply
+        .contains("Last progress:\n- installed dependencies\n- wrote the auth module\n- started the test suite"));
+    assert!(!reply.contains("imported the data"));
+    assert!(reply.contains("Send any message to continue, or /clear to start over."));
+    let _ = std::fs::remove_dir_all(&assistant_dir);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -4275,6 +4346,82 @@ async fn timeout_hook_receives_env_vars() {
     assert!(env.contains("PUSH_ROW_ID=1"));
     assert!(env.contains("PUSH_BACKEND=codex"));
     assert!(env.contains(&format!("PUSH_WORK_DIR={work_dir}")));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn timeout_reports_captured_progress_and_resumes_session() {
+    let state_path = temp_path("timeout-resume-state");
+    let state = state_path.to_string_lossy().to_string();
+    let assistant_dir = temp_path("timeout-resume-assistant");
+    std::fs::create_dir_all(&assistant_dir).unwrap();
+    let mut cfg = test_config(&state, "", &assistant_dir.to_string_lossy());
+    cfg.agent = "pi".to_string();
+    let mut gateway = Gateway::new(cfg).unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut runners = HashMap::new();
+    runners.insert(
+        AgentBackend::Pi,
+        Runner::Fake(FakeRunner {
+            backend: AgentBackend::Pi,
+            session_id: "fake-session".to_string(),
+            calls: calls.clone(),
+            before_return: None,
+            wait_for_release: Some(release.clone()),
+            failure: None,
+            resume_missing_once: None,
+            timeout_info: TimeoutInfo {
+                session_id: Some("rescued-session".to_string()),
+                progress: Some("found the bug in parser.rs".to_string()),
+            },
+        }),
+    );
+    gateway.ctx.runners = Arc::new(runners);
+    gateway.ctx.run_timeout = Duration::from_millis(100);
+    gateway
+        .tick_fake(vec![message(1, "me@icloud.com", "", true, "slow")])
+        .await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if !gateway.ctx.sent_replies.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("timeout reply should be delivered");
+    {
+        let replies = gateway.ctx.sent_replies.lock().unwrap();
+        let reply = &replies[0].1;
+        assert!(reply.contains("Last output:\nfound the bug in parser.rs"));
+        assert!(reply.contains("pi --session rescued-session"));
+    }
+    release.notify_one();
+    gateway
+        .tick_fake(vec![message(2, "me@icloud.com", "", true, "and then")])
+        .await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if gateway.ctx.sent_replies.lock().unwrap().len() >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("second run should complete after release");
+    gateway.queues.clear();
+    gateway.drain_workers().await;
+    // The captured session id was persisted, so the follow-up resumed it.
+    assert_eq!(calls.lock().unwrap()[1].session_id, "rescued-session");
+    let _ = std::fs::remove_dir_all(&assistant_dir);
+    for suffix in ["", ".db", ".audit.jsonl", ".audit.jsonl.lock", ".home"] {
+        let _ = std::fs::remove_file(format!("{state}{suffix}"));
+    }
+    let _ = std::fs::remove_dir_all(format!("{state}.cache"));
+    let _ = std::fs::remove_dir_all(format!("{state}.jobs"));
+    let _ = std::fs::remove_dir_all(format!("{state}.run"));
 }
 
 fn message(row_id: i64, chat: &str, handle: &str, is_from_me: bool, text: &str) -> RawMessage {

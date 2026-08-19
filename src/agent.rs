@@ -29,9 +29,18 @@ pub struct RunOutput {
 /// What went wrong, separated so the gateway can phrase timeouts differently.
 #[derive(Debug)]
 pub enum RunError {
-    Timeout,
+    Timeout(TimeoutInfo),
     SessionMissing(String),
     Failed(String),
+}
+
+/// What a runner managed to capture before a timeout kill. Pi streams its
+/// session id first and assistant messages as they finish, so a timed-out Pi
+/// run can still report both; other runners leave this default.
+#[derive(Debug, Default, Clone)]
+pub struct TimeoutInfo {
+    pub session_id: Option<String>,
+    pub progress: Option<String>,
 }
 
 pub(crate) fn final_reply(backend: &str, reply: &str) -> Result<String, RunError> {
@@ -177,6 +186,7 @@ pub struct FakeRunner {
     pub wait_for_release: Option<std::sync::Arc<tokio::sync::Notify>>,
     pub failure: Option<String>,
     pub resume_missing_once: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub timeout_info: TimeoutInfo,
 }
 
 #[cfg(test)]
@@ -221,7 +231,7 @@ impl FakeRunner {
                 .await
                 .is_err()
             {
-                return Err(RunError::Timeout);
+                return Err(RunError::Timeout(self.timeout_info.clone()));
             }
         }
         if let Some(message) = &self.failure {

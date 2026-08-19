@@ -5,10 +5,11 @@ use std::time::Duration;
 use std::{io, process::Stdio};
 
 use serde_json::Value;
-use tokio::io::AsyncWriteExt;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
-use crate::agent::{final_reply, Request, RunError, RunOutput};
+use crate::agent::{final_reply, Request, RunError, RunOutput, TimeoutInfo};
 
 /// Runner invokes `pi` in non-interactive JSON event mode.
 pub struct Runner {
@@ -58,9 +59,16 @@ impl Runner {
         timeout: Duration,
         mode: RunMode,
     ) -> Result<RunOutput, RunError> {
+        // stdout is read incrementally into shared buffers so a timeout kill
+        // still keeps whatever Pi emitted: the session id (first event) and
+        // the last assistant text so far.
+        let stdout_sink: Arc<std::sync::Mutex<Vec<u8>>> = Arc::default();
+        let stderr_sink: Arc<std::sync::Mutex<Vec<u8>>> = Arc::default();
         let attempt = crate::agent::output_with_retry(|| {
             let mut cmd = self.command(&req, mode);
             let prompt = req.prompt.as_bytes().to_vec();
+            let stdout_sink = stdout_sink.clone();
+            let stderr_sink = stderr_sink.clone();
             async move {
                 let mut child = cmd.spawn()?;
                 let mut stdin = child.stdin.take().ok_or_else(|| {
@@ -68,15 +76,33 @@ impl Runner {
                 })?;
                 let write_result = stdin.write_all(&prompt).await;
                 drop(stdin);
-                let output = child.wait_with_output().await?;
-                if output.status.success() {
+                let stdout_task =
+                    spawn_reader(child.stdout.take().expect("pi stdout piped"), &stdout_sink);
+                let stderr_task =
+                    spawn_reader(child.stderr.take().expect("pi stderr piped"), &stderr_sink);
+                let status = child.wait().await?;
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                if status.success() {
                     write_result?;
                 }
-                Ok(output)
+                let stdout = take_sink(&stdout_sink);
+                let stderr = take_sink(&stderr_sink);
+                Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                })
             }
         });
         let out = match tokio::time::timeout(timeout, attempt).await {
-            Err(_) => return Err(RunError::Timeout),
+            Err(_) => {
+                let captured = parse_partial_jsonl(&take_sink(&stdout_sink));
+                return Err(RunError::Timeout(TimeoutInfo {
+                    session_id: captured.session_id,
+                    progress: captured.reply.filter(|reply| !reply.trim().is_empty()),
+                }));
+            }
             Ok(Err(error)) => return Err(RunError::Failed(format!("run pi: {error}"))),
             Ok(Ok(output)) => output,
         };
@@ -165,6 +191,26 @@ struct ParsedOutput {
     assistant_failed: bool,
 }
 
+fn take_sink(sink: &Arc<std::sync::Mutex<Vec<u8>>>) -> Vec<u8> {
+    std::mem::take(&mut *sink.lock().unwrap())
+}
+
+fn spawn_reader(
+    mut reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    sink: &Arc<std::sync::Mutex<Vec<u8>>>,
+) -> tokio::task::JoinHandle<()> {
+    let sink = sink.clone();
+    tokio::spawn(async move {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match reader.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => sink.lock().unwrap().extend_from_slice(&chunk[..n]),
+            }
+        }
+    })
+}
+
 fn parse_jsonl(stdout: &[u8]) -> Result<ParsedOutput, String> {
     let stdout = std::str::from_utf8(stdout)
         .map_err(|_| "pi returned malformed JSON output (invalid UTF-8)".to_string())?;
@@ -172,46 +218,63 @@ fn parse_jsonl(stdout: &[u8]) -> Result<ParsedOutput, String> {
     for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
         let event: Value = serde_json::from_str(line)
             .map_err(|_| "pi returned malformed JSON output".to_string())?;
-        match event.get("type").and_then(Value::as_str) {
-            Some("session") => {
-                parsed.session_id = event
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_string);
-            }
-            Some("message_end") => {
-                let Some(message) = event.get("message") else {
-                    continue;
-                };
-                if message.get("role").and_then(Value::as_str) != Some("assistant") {
-                    continue;
-                }
-                if matches!(
-                    message.get("stopReason").and_then(Value::as_str),
-                    Some("error" | "aborted")
-                ) {
-                    parsed.reply = None;
-                    parsed.assistant_failed = true;
-                    continue;
-                }
-                let text = message
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
-                    .filter_map(|part| part.get("text").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("");
-                parsed.reply = Some(text);
-                parsed.assistant_failed = false;
-            }
-            _ => {}
-        }
+        apply_event(&event, &mut parsed);
     }
     Ok(parsed)
+}
+
+/// Best-effort parse of a stream cut mid-line by a timeout kill: keep the
+/// events that parsed, skip malformed or truncated ones.
+fn parse_partial_jsonl(stdout: &[u8]) -> ParsedOutput {
+    let text = String::from_utf8_lossy(stdout);
+    let mut parsed = ParsedOutput::default();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        if let Ok(event) = serde_json::from_str::<Value>(line) {
+            apply_event(&event, &mut parsed);
+        }
+    }
+    parsed
+}
+
+fn apply_event(event: &Value, parsed: &mut ParsedOutput) {
+    match event.get("type").and_then(Value::as_str) {
+        Some("session") => {
+            parsed.session_id = event
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string);
+        }
+        Some("message_end") => {
+            let Some(message) = event.get("message") else {
+                return;
+            };
+            if message.get("role").and_then(Value::as_str) != Some("assistant") {
+                return;
+            }
+            if matches!(
+                message.get("stopReason").and_then(Value::as_str),
+                Some("error" | "aborted")
+            ) {
+                parsed.reply = None;
+                parsed.assistant_failed = true;
+                return;
+            }
+            let text = message
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("");
+            parsed.reply = Some(text);
+            parsed.assistant_failed = false;
+        }
+        _ => {}
+    }
 }
 
 fn exit_diagnostic(status: Option<i32>, parse_error: Option<&str>) -> String {
@@ -629,6 +692,54 @@ printf '%s\n' '{"type":"message_end","message":{"role":"assistant","content":[{"
         assert!(args.iter().any(|arg| arg == "--no-context-files"));
         assert!(args.iter().any(|arg| arg == "--no-approve"));
         assert!(!args.iter().any(|arg| arg == "--approve"));
+    }
+
+    #[tokio::test]
+    async fn timeout_captures_session_and_partial_progress() {
+        let work_dir = temp_dir("pi-timeout-capture");
+        let cli = FakeCli::new(
+            "pi",
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"type\":\"session\",\"id\":\"cap-session\"}'\nprintf '%s\\n' '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"halfway through the refactor\"}],\"stopReason\":\"stop\"}}'\nprintf 'truncated {\"type\":\"mess'\nsleep 2\n",
+        );
+        let runner = Runner { bin: cli.bin() };
+
+        let error = runner
+            .run(
+                request(work_dir.to_str().unwrap(), true),
+                Duration::from_millis(200),
+            )
+            .await
+            .unwrap_err();
+
+        let RunError::Timeout(info) = error else {
+            panic!("expected timeout, got {error:?}")
+        };
+        assert_eq!(info.session_id.as_deref(), Some("cap-session"));
+        assert_eq!(
+            info.progress.as_deref(),
+            Some("halfway through the refactor")
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_without_any_captured_output_uses_empty_info() {
+        let work_dir = temp_dir("pi-timeout-empty");
+        let cli = FakeCli::new("pi", "#!/bin/sh\ncat >/dev/null\nsleep 2\n");
+        let runner = Runner { bin: cli.bin() };
+
+        let error = runner
+            .run(
+                request(work_dir.to_str().unwrap(), true),
+                Duration::from_millis(200),
+            )
+            .await
+            .unwrap_err();
+
+        let RunError::Timeout(info) = error else {
+            panic!("expected timeout, got {error:?}")
+        };
+        assert_eq!(info.session_id, None);
+        assert_eq!(info.progress, None);
     }
 
     fn success_script(args_path: &std::path::Path, session: &str, reply: &str) -> String {

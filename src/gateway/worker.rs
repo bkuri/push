@@ -2,7 +2,7 @@
 //! outcome in canonical history, and delivers the reply.
 
 use std::future::{pending, Future};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
-use crate::agent::{Request, RunError};
+use crate::agent::{Request, RunError, TimeoutInfo};
 use crate::history::{DeliveryStatus, OutboundMessage, OutboundOrigin};
 use crate::image::{PreparedImages, MAX_IMAGE_BYTES, MAX_IMAGE_COUNT};
 use crate::prompt::{ComposedPrompt, Composer};
@@ -456,7 +456,7 @@ where
                 "deliver backend reply",
             );
         }
-        Some(Err(RunError::Timeout)) => {
+        Some(Err(RunError::Timeout(info))) => {
             warn!("[{}] {} run timed out", job.thread, runner.label());
             audit(
                 ctx,
@@ -468,7 +468,19 @@ where
                     format!("{} run timed out", runner.label()),
                 ),
             );
-            let reply = timeout_reply(ctx, &job, &work_dir).await;
+            // A captured session id lets the next message resume the same
+            // backend session instead of rebuilding from history.
+            if let Some(session_id) = info.session_id.as_deref() {
+                if let Err(e) = ctx
+                    .store
+                    .lock()
+                    .unwrap()
+                    .mark_started(&job.thread, Some(session_id))
+                {
+                    error!("[{}] session save error: {e}", job.thread);
+                }
+            }
+            let reply = timeout_reply(ctx, &job, &work_dir, &info).await;
             finish_run_with_gateway_reply(
                 ctx,
                 &job,
@@ -698,14 +710,67 @@ struct ReplyLabels {
     completion: &'static str,
 }
 
-const DEFAULT_TIMEOUT_REPLY: &str =
-    "That took too long and was stopped. Try again or simplify the request.";
+const MAX_PROGRESS_LINES: usize = 3;
+const MAX_PROGRESS_LINE_CHARS: usize = 200;
+const MAX_CAPTURED_PROGRESS_CHARS: usize = 400;
+
+/// Default timeout reply: captured backend output (or PROGRESS.md
+/// checkpoints as a fallback) plus follow-up hints. `timeout_reply`
+/// replaces this wholesale; the hook replaces everything.
+fn default_timeout_reply(work_dir: &str, info: &TimeoutInfo, backend: &str) -> String {
+    let mut reply = String::from("That took too long and was stopped.");
+    if let Some(progress) = info
+        .progress
+        .as_deref()
+        .map(str::trim)
+        .filter(|progress| !progress.is_empty())
+    {
+        // Keep the tail: the newest writing is at the end of a partial reply.
+        let chars: Vec<char> = progress.chars().collect();
+        let start = chars.len().saturating_sub(MAX_CAPTURED_PROGRESS_CHARS);
+        let text: String = chars[start..].iter().collect();
+        reply.push_str("\nLast output:\n");
+        reply.push_str(if start > 0 { "…" } else { "" });
+        reply.push_str(text.trim());
+    } else if let Ok(progress) = std::fs::read_to_string(Path::new(work_dir).join("PROGRESS.md")) {
+        let checkpoints: Vec<&str> = progress
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .rev()
+            .take(MAX_PROGRESS_LINES)
+            .collect();
+        if !checkpoints.is_empty() {
+            reply.push_str(" Last progress:");
+            for line in checkpoints.iter().rev() {
+                reply.push_str("\n- ");
+                // The file may already use bullets; the reply provides its own.
+                reply.extend(
+                    line.trim()
+                        .trim_start_matches('-')
+                        .trim()
+                        .chars()
+                        .take(MAX_PROGRESS_LINE_CHARS),
+                );
+            }
+        }
+    }
+    if let Some(session_id) = &info.session_id {
+        // Only the Pi runner captures the session id today; it resumes with
+        // `pi --session <id>`.
+        reply.push_str(&format!(
+            "\nSession saved; send any message to continue, or resume manually with:\n{backend} --session {session_id}",
+        ));
+    } else {
+        reply.push_str("\nSend any message to continue, or /clear to start over.");
+    }
+    reply
+}
 
 const MAX_HOOK_STDOUT: usize = 64 * 1024;
 
 /// Resolves the reply for a timed-out run: hook stdout (trimmed) wins, then
 /// `timeout_reply`, then the default. Hook problems never lose the message.
-async fn timeout_reply(ctx: &Ctx, job: &Job, work_dir: &str) -> String {
+async fn timeout_reply(ctx: &Ctx, job: &Job, work_dir: &str, info: &TimeoutInfo) -> String {
     let mut reply = ctx
         .cfg
         .timeout_reply
@@ -713,7 +778,7 @@ async fn timeout_reply(ctx: &Ctx, job: &Job, work_dir: &str) -> String {
         .map(str::trim)
         .filter(|reply| !reply.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| DEFAULT_TIMEOUT_REPLY.to_string());
+        .unwrap_or_else(|| default_timeout_reply(work_dir, info, job.backend.as_str()));
     let Some(hook) = ctx.cfg.timeout_hook.clone() else {
         return reply;
     };

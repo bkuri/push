@@ -194,7 +194,7 @@ pub async fn assert_runner_contract(contract: RunnerContract) {
         .await
     {
         Err(RunError::Failed(_)) => {}
-        Err(RunError::Timeout) => panic!("{} failed run timed out", contract.name),
+        Err(RunError::Timeout(_)) => panic!("{} failed run timed out", contract.name),
         Err(RunError::SessionMissing(msg)) => {
             panic!(
                 "{} failed run reported missing session: {msg}",
@@ -211,7 +211,7 @@ pub async fn assert_runner_contract(contract: RunnerContract) {
         .run(case.request.as_request(), case.timeout)
         .await
     {
-        Err(RunError::Timeout) => {}
+        Err(RunError::Timeout(_)) => {}
         Err(RunError::Failed(msg)) => panic!("{} timeout failed: {msg}", contract.name),
         Err(RunError::SessionMissing(msg)) => {
             panic!("{} timeout reported missing session: {msg}", contract.name)
