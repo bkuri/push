@@ -756,9 +756,9 @@ fn default_timeout_reply(work_dir: &str, info: &TimeoutInfo, backend: &str) -> S
     }
     if let Some(session_id) = &info.session_id {
         // Only the Pi runner captures the session id today; it resumes with
-        // `pi --session <id>`.
+        // `pi --session <id>`. Fenced so chat clients offer one-tap copy.
         reply.push_str(&format!(
-            "\nSession saved; send any message to continue, or resume manually with:\n{backend} --session {session_id}",
+            "\n\nResume in {backend} with the following command:\n\n```\n{backend} --session {session_id}\n```",
         ));
     } else {
         reply.push_str("\nSend any message to continue, or /clear to start over.");

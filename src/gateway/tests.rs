@@ -4395,7 +4395,9 @@ async fn timeout_reports_captured_progress_and_resumes_session() {
         let replies = gateway.ctx.sent_replies.lock().unwrap();
         let reply = &replies[0].1;
         assert!(reply.contains("Last output:\nfound the bug in parser.rs"));
-        assert!(reply.contains("pi --session rescued-session"));
+        assert!(reply.contains(
+            "Resume in pi with the following command:\n\n```\npi --session rescued-session\n```"
+        ));
     }
     release.notify_one();
     gateway
