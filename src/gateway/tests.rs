@@ -4193,7 +4193,8 @@ async fn timeout_hook_failure_falls_back() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn timeout_hook_overrun_falls_back() {
-    // The hook sleeps past the 5s budget; the reply must still be delivered.
+    // The hook sleeps past the 5s budget; the reply must still be delivered
+    // close to the budget itself (5s plus CI margin, not 15s).
     let cli = crate::test_support::FakeCli::new("hook-slow", "#!/bin/sh\nsleep 30\n");
     let started = std::time::Instant::now();
     let (replies, _) = run_to_timeout("timeout-hook-slow", &|cfg| {
@@ -4201,10 +4202,38 @@ async fn timeout_hook_overrun_falls_back() {
         cfg.timeout_hook = Some(cli.bin());
     })
     .await;
-    assert!(started.elapsed() < std::time::Duration::from_secs(15));
+    let elapsed = started.elapsed();
+    assert!(elapsed >= std::time::Duration::from_millis(4_500));
+    assert!(elapsed < std::time::Duration::from_secs(8));
     assert!(replies
         .iter()
         .any(|(_, reply)| reply.contains("custom timeout text")));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn timeout_hook_accepts_shell_syntax() {
+    // The hook value runs through /bin/sh -c, so arguments and expansion
+    // work without a wrapper script.
+    let (replies, _) = run_to_timeout("timeout-hook-shell", &|cfg| {
+        cfg.timeout_hook = Some("echo shell-hook-$PUSH_BACKEND".to_string());
+    })
+    .await;
+    assert!(replies
+        .iter()
+        .any(|(_, reply)| reply.contains("shell-hook-codex")));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blank_timeout_reply_falls_back_to_default() {
+    // A whitespace-only timeout_reply is treated as unset rather than
+    // delivering an empty message.
+    let (replies, _) = run_to_timeout("timeout-blank-reply", &|cfg| {
+        cfg.timeout_reply = Some("   ".to_string());
+    })
+    .await;
+    assert!(replies
+        .iter()
+        .any(|(_, reply)| reply.contains("That took too long and was stopped")));
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -707,16 +707,28 @@ async fn timeout_reply(ctx: &Ctx, job: &Job, work_dir: &str) -> String {
     let mut reply = ctx
         .cfg
         .timeout_reply
-        .clone()
+        .as_deref()
+        .map(str::trim)
+        .filter(|reply| !reply.is_empty())
+        .map(str::to_string)
         .unwrap_or_else(|| DEFAULT_TIMEOUT_REPLY.to_string());
     let Some(hook) = ctx.cfg.timeout_hook.clone() else {
         return reply;
     };
-    let spawned = tokio::process::Command::new(&hook)
+    // The hook is documented as a shell command: run it through /bin/sh so
+    // arguments, pipes, and redirects work. kill_on_drop + its own process
+    // group stop an over-budget hook when the timeout drops the future.
+    // ponytail: kills the direct child only; a group-wide kill(-pgid) if a
+    // hook reliably leaves grandchildren behind.
+    let spawned = tokio::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&hook)
         .env("PUSH_THREAD", &job.thread)
         .env("PUSH_ROW_ID", job.row_id.to_string())
         .env("PUSH_BACKEND", job.backend.as_str())
         .env("PUSH_WORK_DIR", work_dir)
+        .kill_on_drop(true)
+        .process_group(0)
         .output();
     match tokio::time::timeout(Duration::from_secs(5), spawned).await {
         Ok(Ok(output)) if output.status.success() => {
