@@ -701,6 +701,8 @@ struct ReplyLabels {
 const DEFAULT_TIMEOUT_REPLY: &str =
     "That took too long and was stopped. Try again or simplify the request.";
 
+const MAX_HOOK_STDOUT: usize = 64 * 1024;
+
 /// Resolves the reply for a timed-out run: hook stdout (trimmed) wins, then
 /// `timeout_reply`, then the default. Hook problems never lose the message.
 async fn timeout_reply(ctx: &Ctx, job: &Job, work_dir: &str) -> String {
@@ -727,31 +729,81 @@ async fn timeout_reply(ctx: &Ctx, job: &Job, work_dir: &str) -> String {
     // an over-budget hook when the timeout drops the future.
     // ponytail: kills the direct child only; a group-wide kill(-pgid) if a
     // hook reliably leaves grandchildren behind.
-    let spawned = tokio::process::Command::new("/bin/sh")
+    // The hook is documented as a shell command: run it through /bin/sh so
+    // arguments, pipes, and redirects work (POSIX sh only — no pipefail,
+    // which older dash rejects). stdout is read with a byte cap so a runaway
+    // hook cannot exhaust memory; exceeding the cap kills the hook and uses
+    // the fallback reply. kill_on_drop + its own process group stop an
+    // over-budget hook when the timeout drops the future.
+    // ponytail: kills the direct child only; a group-wide kill(-pgid) if a
+    // hook reliably leaves grandchildren behind.
+    let child = tokio::process::Command::new("/bin/sh")
         .arg("-c")
-        .arg(format!("set -o pipefail; {hook} | head -c 65536"))
+        .arg(&hook)
         .env("PUSH_THREAD", &job.thread)
         .env("PUSH_ROW_ID", job.row_id.to_string())
         .env("PUSH_BACKEND", job.backend.as_str())
         .env("PUSH_WORK_DIR", work_dir)
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
         .process_group(0)
-        .output();
-    match tokio::time::timeout(Duration::from_secs(5), spawned).await {
-        Ok(Ok(output)) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            warn!("[{}] timeout hook failed to run: {error}", job.thread);
+            return reply;
+        }
+    };
+    let mut stdout_pipe = child.stdout.take().expect("hook stdout piped");
+    let collect = async {
+        use tokio::io::AsyncReadExt;
+        let mut stdout = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let mut capped = false;
+        loop {
+            match stdout_pipe.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if stdout.len() + n > MAX_HOOK_STDOUT {
+                        capped = true;
+                        break;
+                    }
+                    stdout.extend_from_slice(&chunk[..n]);
+                }
+            }
+        }
+        (stdout, capped)
+    };
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        let (stdout, capped) = collect.await;
+        if capped {
+            let _ = child.kill().await;
+        }
+        (stdout, capped, child.wait().await)
+    })
+    .await;
+    match result {
+        Ok((stdout, false, Ok(status))) if status.success() => {
+            let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
             if stdout.is_empty() {
                 warn!("[{}] timeout hook produced no output", job.thread);
             } else {
                 reply = stdout;
             }
         }
-        Ok(Ok(output)) => warn!(
-            "[{}] timeout hook exited with {}: using fallback reply",
-            job.thread, output.status
+        Ok((_, true, _)) => warn!(
+            "[{}] timeout hook exceeded {} bytes: using fallback reply",
+            job.thread, MAX_HOOK_STDOUT
         ),
-        Ok(Err(error)) => warn!("[{}] timeout hook failed to run: {error}", job.thread),
+        Ok((_, _, Ok(status))) => warn!(
+            "[{}] timeout hook exited with {status}: using fallback reply",
+            job.thread
+        ),
+        Ok((_, _, Err(error))) => {
+            warn!("[{}] timeout hook failed to run: {error}", job.thread)
+        }
         Err(_) => warn!(
             "[{}] timeout hook exceeded 5s: using fallback reply",
             job.thread
