@@ -4224,6 +4224,24 @@ async fn timeout_hook_accepts_shell_syntax() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn timeout_hook_unbounded_output_falls_back() {
+    // A hook that spews without end must not exhaust memory or deliver a
+    // giant reply: head -c caps capture, pipefail fails the pipeline, the
+    // fallback reply is used.
+    let (replies, _) = run_to_timeout("timeout-hook-runaway", &|cfg| {
+        cfg.timeout_reply = Some("custom timeout text".to_string());
+        cfg.timeout_hook = Some("yes runaway".to_string());
+    })
+    .await;
+    assert!(replies
+        .iter()
+        .any(|(_, reply)| reply.contains("custom timeout text")));
+    assert!(replies
+        .iter()
+        .all(|(_, reply)| !reply.contains("runawayrunaway")));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn blank_timeout_reply_falls_back_to_default() {
     // A whitespace-only timeout_reply is treated as unset rather than
     // delivering an empty message.

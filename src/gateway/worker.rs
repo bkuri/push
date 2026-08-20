@@ -720,13 +720,21 @@ async fn timeout_reply(ctx: &Ctx, job: &Job, work_dir: &str) -> String {
     // group stop an over-budget hook when the timeout drops the future.
     // ponytail: kills the direct child only; a group-wide kill(-pgid) if a
     // hook reliably leaves grandchildren behind.
+    // The hook is documented as a shell command: run it through /bin/sh so
+    // arguments, pipes, and redirects work. `head -c` bounds captured stdout
+    // (a runaway hook SIGPIPEs instead of exhausting memory; pipefail then
+    // routes it to the fallback). kill_on_drop + its own process group stop
+    // an over-budget hook when the timeout drops the future.
+    // ponytail: kills the direct child only; a group-wide kill(-pgid) if a
+    // hook reliably leaves grandchildren behind.
     let spawned = tokio::process::Command::new("/bin/sh")
         .arg("-c")
-        .arg(&hook)
+        .arg(format!("set -o pipefail; {hook} | head -c 65536"))
         .env("PUSH_THREAD", &job.thread)
         .env("PUSH_ROW_ID", job.row_id.to_string())
         .env("PUSH_BACKEND", job.backend.as_str())
         .env("PUSH_WORK_DIR", work_dir)
+        .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
         .process_group(0)
         .output();
