@@ -703,6 +703,37 @@ const DEFAULT_TIMEOUT_REPLY: &str =
 
 const MAX_HOOK_STDOUT: usize = 64 * 1024;
 
+/// Reads hook stdout with a byte cap, returning the bytes, whether the cap
+/// was exceeded, and the first read error (if any). A read error is not
+/// EOF: partial output from a failing pipe is a hook failure, so the error
+/// is surfaced for the caller to log and fall back.
+pub(crate) async fn read_hook_stdout<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+) -> (Vec<u8>, bool, Option<std::io::Error>) {
+    use tokio::io::AsyncReadExt;
+    let mut stdout = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut capped = false;
+    let mut read_error = None;
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if stdout.len() + n > MAX_HOOK_STDOUT {
+                    capped = true;
+                    break;
+                }
+                stdout.extend_from_slice(&chunk[..n]);
+            }
+            Err(error) => {
+                read_error = Some(error);
+                break;
+            }
+        }
+    }
+    (stdout, capped, read_error)
+}
+
 /// Resolves the reply for a timed-out run: hook stdout (trimmed) wins, then
 /// `timeout_reply`, then the default. Hook problems never lose the message.
 async fn timeout_reply(ctx: &Ctx, job: &Job, work_dir: &str) -> String {
@@ -745,35 +776,21 @@ async fn timeout_reply(ctx: &Ctx, job: &Job, work_dir: &str) -> String {
         }
     };
     let mut stdout_pipe = child.stdout.take().expect("hook stdout piped");
-    let collect = async {
-        use tokio::io::AsyncReadExt;
-        let mut stdout = Vec::new();
-        let mut chunk = [0u8; 8192];
-        let mut capped = false;
-        loop {
-            match stdout_pipe.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if stdout.len() + n > MAX_HOOK_STDOUT {
-                        capped = true;
-                        break;
-                    }
-                    stdout.extend_from_slice(&chunk[..n]);
-                }
-            }
-        }
-        (stdout, capped)
-    };
+    let collect = read_hook_stdout(&mut stdout_pipe);
     let result = tokio::time::timeout(Duration::from_secs(5), async {
-        let (stdout, capped) = collect.await;
+        let (stdout, capped, read_error) = collect.await;
         if capped {
             let _ = child.kill().await;
         }
-        (stdout, capped, child.wait().await)
+        (stdout, capped, read_error, child.wait().await)
     })
     .await;
     match result {
-        Ok((stdout, false, Ok(status))) if status.success() => {
+        Ok((_, _, Some(read_error), _)) => warn!(
+            "[{}] timeout hook stdout read failed: {read_error}: using fallback reply",
+            job.thread
+        ),
+        Ok((stdout, false, None, Ok(status))) if status.success() => {
             let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
             if stdout.is_empty() {
                 warn!("[{}] timeout hook produced no output", job.thread);
@@ -781,15 +798,15 @@ async fn timeout_reply(ctx: &Ctx, job: &Job, work_dir: &str) -> String {
                 reply = stdout;
             }
         }
-        Ok((_, true, _)) => warn!(
+        Ok((_, true, _, _)) => warn!(
             "[{}] timeout hook exceeded {} bytes: using fallback reply",
             job.thread, MAX_HOOK_STDOUT
         ),
-        Ok((_, _, Ok(status))) => warn!(
+        Ok((_, _, _, Ok(status))) => warn!(
             "[{}] timeout hook exited with {status}: using fallback reply",
             job.thread
         ),
-        Ok((_, _, Err(error))) => {
+        Ok((_, _, _, Err(error))) => {
             warn!("[{}] timeout hook failed to run: {error}", job.thread)
         }
         Err(_) => warn!(

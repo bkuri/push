@@ -4241,6 +4241,56 @@ async fn timeout_hook_unbounded_output_falls_back() {
         .all(|(_, reply)| !reply.contains("runawayrunaway")));
 }
 
+/// Reader that yields bytes once, then fails — models a hook pipe that
+/// breaks mid-write instead of reaching EOF.
+struct FailingPipeReader {
+    bytes: Vec<u8>,
+    done: bool,
+}
+
+impl tokio::io::AsyncRead for FailingPipeReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.done {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "pipe broke mid-write",
+            )));
+        }
+        this.done = true;
+        buf.put_slice(&this.bytes);
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hook_stdout_read_error_surfaces_not_swallowed() {
+    // A read error after partial output must be returned to the caller so
+    // the worker logs it and uses the fallback reply; treating it as EOF
+    // would deliver the partial bytes as a successful hook result.
+    use super::worker::read_hook_stdout;
+
+    let mut reader = FailingPipeReader {
+        bytes: b"partial".to_vec(),
+        done: false,
+    };
+    let (stdout, capped, read_error) = read_hook_stdout(&mut reader).await;
+    assert_eq!(stdout, b"partial");
+    assert!(!capped);
+    assert!(read_error.is_some());
+
+    // Clean EOF stays clean: no error, all bytes.
+    let mut eof = std::io::Cursor::new(b"all good".to_vec());
+    let (stdout, capped, read_error) = read_hook_stdout(&mut eof).await;
+    assert_eq!(stdout, b"all good");
+    assert!(!capped);
+    assert!(read_error.is_none());
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn blank_timeout_reply_falls_back_to_default() {
     // A whitespace-only timeout_reply is treated as unset rather than
