@@ -718,24 +718,12 @@ async fn timeout_reply(ctx: &Ctx, job: &Job, work_dir: &str) -> String {
         return reply;
     };
     // The hook is documented as a shell command: run it through /bin/sh so
-    // arguments, pipes, and redirects work. kill_on_drop + its own process
-    // group stop an over-budget hook when the timeout drops the future.
-    // ponytail: kills the direct child only; a group-wide kill(-pgid) if a
-    // hook reliably leaves grandchildren behind.
-    // The hook is documented as a shell command: run it through /bin/sh so
-    // arguments, pipes, and redirects work. `head -c` bounds captured stdout
-    // (a runaway hook SIGPIPEs instead of exhausting memory; pipefail then
-    // routes it to the fallback). kill_on_drop + its own process group stop
-    // an over-budget hook when the timeout drops the future.
-    // ponytail: kills the direct child only; a group-wide kill(-pgid) if a
-    // hook reliably leaves grandchildren behind.
-    // The hook is documented as a shell command: run it through /bin/sh so
     // arguments, pipes, and redirects work (POSIX sh only — no pipefail,
     // which older dash rejects). stdout is read with a byte cap so a runaway
     // hook cannot exhaust memory; exceeding the cap kills the hook and uses
     // the fallback reply. kill_on_drop + its own process group stop an
     // over-budget hook when the timeout drops the future.
-    // ponytail: kills the direct child only; a group-wide kill(-pgid) if a
+    // note: kills the direct child only; a group-wide kill(-pgid) if a
     // hook reliably leaves grandchildren behind.
     let child = tokio::process::Command::new("/bin/sh")
         .arg("-c")
