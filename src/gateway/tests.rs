@@ -4211,6 +4211,45 @@ async fn timeout_hook_overrun_falls_back() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn timeout_hook_descendants_are_killed() {
+    // A hook that backgrounds a long sleep must not leak it past the 5s
+    // budget: the whole process group is signalled, not just the shell.
+    // (pid file outside $PUSH_WORK_DIR: run_to_timeout wipes the work dir.)
+    let pid_path = temp_path("timeout-hook-descendant-pid");
+    let hook = format!(
+        "sleep 60 & echo $! > '{}'; sleep 30",
+        pid_path.to_string_lossy()
+    );
+    let (replies, _) = run_to_timeout("timeout-hook-descendant", &|cfg| {
+        cfg.timeout_reply = Some("custom timeout text".to_string());
+        cfg.timeout_hook = Some(hook.clone());
+    })
+    .await;
+    assert!(replies
+        .iter()
+        .any(|(_, reply)| reply.contains("custom timeout text")));
+
+    let pid: libc::pid_t = std::fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let _ = std::fs::remove_file(&pid_path);
+    // SIGKILL delivery is asynchronous; poll briefly for the descendant to
+    // disappear (signal 0 probes existence without sending anything).
+    let mut dead = false;
+    for _ in 0..100 {
+        // Safety: signal syscall with an integer pid; no pointers involved.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            dead = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(dead, "hook descendant {pid} survived the timeout kill");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn timeout_hook_accepts_shell_syntax() {
     // The hook value runs through /bin/sh -c, so arguments and expansion
     // work without a wrapper script.

@@ -703,6 +703,17 @@ const DEFAULT_TIMEOUT_REPLY: &str =
 
 const MAX_HOOK_STDOUT: usize = 64 * 1024;
 
+/// SIGKILLs the hook's whole process group (negative pid). Covers the shell
+/// leader and any backgrounded descendants — child.kill()/kill_on_drop only
+/// ever signal the leader. Errors are ignored: the group may already be gone
+/// on a given path.
+fn kill_hook_group(pgid: libc::pid_t) {
+    // Safety: signal syscall with an integer pid; no pointers involved.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+}
+
 /// Reads hook stdout with a byte cap, returning the bytes, whether the cap
 /// was exceeded, and the first read error (if any). A read error is not
 /// EOF: partial output from a failing pipe is a hook failure, so the error
@@ -752,10 +763,10 @@ async fn timeout_reply(ctx: &Ctx, job: &Job, work_dir: &str) -> String {
     // arguments, pipes, and redirects work (POSIX sh only — no pipefail,
     // which older dash rejects). stdout is read with a byte cap so a runaway
     // hook cannot exhaust memory; exceeding the cap kills the hook and uses
-    // the fallback reply. kill_on_drop + its own process group stop an
-    // over-budget hook when the timeout drops the future.
-    // note: kills the direct child only; a group-wide kill(-pgid) if a
-    // hook reliably leaves grandchildren behind.
+    // the fallback reply. The hook runs in its own process group
+    // (process_group(0), leader pid == pgid) and every failure path
+    // signals the whole group, so backgrounded descendants die with the
+    // shell instead of leaking past the budget.
     let child = tokio::process::Command::new("/bin/sh")
         .arg("-c")
         .arg(&hook)
@@ -776,11 +787,15 @@ async fn timeout_reply(ctx: &Ctx, job: &Job, work_dir: &str) -> String {
         }
     };
     let mut stdout_pipe = child.stdout.take().expect("hook stdout piped");
+    // Leader pid == process group id (process_group(0)); kept outside the
+    // timeout scope so the expiry path can still signal the group after the
+    // future (and the Child) is dropped.
+    let hook_pgid = child.id().expect("hook child alive before wait") as libc::pid_t;
     let collect = read_hook_stdout(&mut stdout_pipe);
     let result = tokio::time::timeout(Duration::from_secs(5), async {
         let (stdout, capped, read_error) = collect.await;
         if capped {
-            let _ = child.kill().await;
+            kill_hook_group(hook_pgid);
         }
         (stdout, capped, read_error, child.wait().await)
     })
@@ -809,10 +824,15 @@ async fn timeout_reply(ctx: &Ctx, job: &Job, work_dir: &str) -> String {
         Ok((_, _, _, Err(error))) => {
             warn!("[{}] timeout hook failed to run: {error}", job.thread)
         }
-        Err(_) => warn!(
-            "[{}] timeout hook exceeded 5s: using fallback reply",
-            job.thread
-        ),
+        Err(_) => {
+            // kill_on_drop reaped the leader when the inner future dropped;
+            // the group signal takes care of any descendants it spawned.
+            kill_hook_group(hook_pgid);
+            warn!(
+                "[{}] timeout hook exceeded 5s: using fallback reply",
+                job.thread
+            )
+        }
     }
     reply
 }
