@@ -1,6 +1,6 @@
 //! Gateway configuration loaded from a TOML file.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -76,6 +76,10 @@ pub struct Config {
     pub agent: String,
     #[serde(default)]
     pub routes: Vec<RouteRule>,
+    /// Gateway-level slash commands: `/name [args...]` runs the mapped shell
+    /// command and relays its stdout verbatim, without an agent turn.
+    #[serde(default)]
+    pub command_hooks: HashMap<String, String>,
     /// Canonical root of the single user-owned assistant repository.
     #[serde(default)]
     pub assistant_root: String,
@@ -921,6 +925,7 @@ mod tests {
             voice_name: DEFAULT_VOICE_NAME.to_string(),
             agent: "codex".to_string(),
             routes: Vec::new(),
+            command_hooks: HashMap::new(),
             assistant_root: root.to_string_lossy().to_string(),
             jobs_dir: root.join("jobs").to_string_lossy().to_string(),
             jobs_agent: None,

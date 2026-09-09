@@ -1601,6 +1601,114 @@ async fn telegram_filters_before_agent_and_replies_to_originating_chat() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn command_hook_runs_and_relays_stdout_without_agent() {
+    let state_path = temp_state_path();
+    let sessions_dir = temp_path("command-hook-sessions");
+    let assistant_dir = temp_path("command-hook-assistant");
+    std::fs::create_dir_all(&assistant_dir).unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let hook_path = temp_path("command-hook-script");
+    let script = "#!/bin/sh\necho \"status: ok args=[$*] thread=$PUSH_THREAD backend=$PUSH_BACKEND row=$PUSH_ROW_ID session=${PUSH_SESSION_ID:-none}\"\n";
+    std::fs::write(&hook_path, script).unwrap();
+    let mut cfg = test_config(
+        &state_path,
+        sessions_dir.to_str().unwrap(),
+        assistant_dir.to_str().unwrap(),
+    );
+    cfg.channel = "telegram".to_string();
+    cfg.self_handles.clear();
+    cfg.allow_from.clear();
+    cfg.telegram_bot_token = Some("secret".to_string());
+    cfg.telegram_allow_user_ids = vec![7];
+    cfg.command_hooks.insert(
+        "status".to_string(),
+        format!("sh {}", hook_path.to_str().unwrap()),
+    );
+    let mut gateway = Gateway::new(cfg).unwrap();
+    gateway.ctx.runners = Arc::new(fake_runners(calls.clone()));
+
+    run_messages(
+        &mut gateway,
+        vec![
+            telegram_message(1, 7, 7, false, "/status"),
+            // A mapped command owns all its forms: args reach the hook.
+            telegram_message(2, 7, 7, false, "/status foo bar"),
+            telegram_message(3, 7, 7, false, "/help"),
+        ],
+    )
+    .await;
+
+    assert_eq!(calls.lock().unwrap().len(), 0);
+    let replies = gateway.ctx.sent_replies.lock().unwrap();
+    assert_eq!(
+        &replies[0..2],
+        [
+            (
+                "7".to_string(),
+                "status: ok args=[] thread=telegram:dm:7 backend=codex row=1 session=none"
+                    .to_string()
+            ),
+            (
+                "7".to_string(),
+                "status: ok args=[foo bar] thread=telegram:dm:7 backend=codex row=2 session=none"
+                    .to_string()
+            )
+        ]
+    );
+    assert_eq!(
+        replies[2].1,
+        "Commands:\n/clear - start a fresh conversation\n/stop - stop the active request\n/help - this message\n\nCustom commands: /status"
+    );
+
+    let _ = std::fs::remove_file(&state_path);
+    let _ = std::fs::remove_file(format!("{state_path}.audit.jsonl"));
+    let _ = std::fs::remove_file(&hook_path);
+    let _ = std::fs::remove_dir_all(sessions_dir);
+    let _ = std::fs::remove_dir_all(assistant_dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unknown_slash_command_falls_through_to_agent() {
+    let state_path = temp_state_path();
+    let sessions_dir = temp_path("slash-fallthrough-sessions");
+    let assistant_dir = temp_path("slash-fallthrough-assistant");
+    std::fs::create_dir_all(&assistant_dir).unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut cfg = test_config(
+        &state_path,
+        sessions_dir.to_str().unwrap(),
+        assistant_dir.to_str().unwrap(),
+    );
+    cfg.channel = "telegram".to_string();
+    cfg.self_handles.clear();
+    cfg.allow_from.clear();
+    cfg.telegram_bot_token = Some("secret".to_string());
+    cfg.telegram_allow_user_ids = vec![7];
+    cfg.command_hooks
+        .insert("status".to_string(), "true".to_string());
+    let mut gateway = Gateway::new(cfg).unwrap();
+    gateway.ctx.runners = Arc::new(fake_runners(calls.clone()));
+
+    run_messages(
+        &mut gateway,
+        vec![telegram_message(1, 7, 7, false, "/bogus details")],
+    )
+    .await;
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        crate::prompt::current_message(&calls[0].prompt).as_deref(),
+        Some("/bogus details")
+    );
+
+    let _ = std::fs::remove_file(&state_path);
+    let _ = std::fs::remove_file(format!("{state_path}.audit.jsonl"));
+    let _ = std::fs::remove_dir_all(sessions_dir);
+    let _ = std::fs::remove_dir_all(assistant_dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn telegram_topic_gets_own_thread_and_reply_targets_the_topic() {
     let state_path = temp_state_path();
     let sessions_dir = temp_path("telegram-topic-sessions");
@@ -3974,6 +4082,7 @@ fn test_config(state_path: &str, _sessions_dir: &str, assistant_dir: &str) -> Co
         voice_name: crate::config::DEFAULT_VOICE_NAME.to_string(),
         agent: "codex".to_string(),
         routes: Vec::new(),
+        command_hooks: HashMap::new(),
         assistant_root: assistant_dir.to_string(),
         jobs_dir: format!("{state_path}.jobs"),
         jobs_agent: None,

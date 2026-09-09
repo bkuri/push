@@ -326,6 +326,22 @@ impl Store {
         Ok(())
     }
 
+    /// Read-only session lookup for info commands: the stored session id for
+    /// a thread, or None when the thread has no session yet. Unlike
+    /// `session_for`, never creates a row.
+    pub fn peek_session_id(&self, thread: &str) -> Option<String> {
+        let (channel, thread_key) = split_thread(thread).ok()?;
+        self.conn
+            .query_row(
+                "SELECT session_id FROM backend_sessions
+                 WHERE channel = ?1 AND thread_key = ?2",
+                params![channel, thread_key],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .filter(|id| !id.trim().is_empty())
+    }
+
     /// Returns the agent session id for a thread, creating one if needed. The
     /// second value is true when the backend has not started that session yet.
     pub fn session_for(
