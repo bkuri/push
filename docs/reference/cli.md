@@ -337,7 +337,9 @@ The reply is the command's trimmed stdout, relayed verbatim — no agent turn,
 no tokens. A mapped command owns all its forms: message arguments are
 appended to the command line as trailing positional parameters (`$1`, `$2`,
 ... after the command's own arguments), so command-shaped input stays
-deterministic and never becomes prompt content:
+deterministic and never becomes prompt content. Names are normalized to
+lowercase at load and must be ASCII letters, digits, `-` or `_` — names
+shadowing built-in commands (`/clear`, `/stop`, `/help`) are rejected:
 
 ```toml
 [command_hooks]
@@ -349,14 +351,14 @@ report = "~/bin/report.sh"
 ```
 
 With this config, `/report` runs `~/bin/report.sh` and `/report agents` runs
-`~/bin/report.sh agents`. Command names match case-insensitively (`/Report`
-works too). Message arguments are split on whitespace, so a multi-line
-message becomes multiple parameters. Hooks run with a timeout and a stdout
-cap (hook output beyond 64 KiB is cut off); a failing or timed-out hook
-replies with a short error and never falls back to the backend. Unknown
-slash commands still reach the backend as regular messages. Hook output is
-delivered like any gateway reply and is recorded in canonical history.
-`/help` lists configured hook commands under "Custom commands" (sorted).
+`~/bin/report.sh agents`. Built-in commands keep exact matching: `/clear
+typo` reaches the backend as a regular message, unchanged. Hooks run with a
+timeout and a stdout/stderr cap (output beyond 64 KiB is an error reply); a
+failing or timed-out hook replies with a short error and never falls back
+to the backend. Unknown slash commands still reach the backend as regular
+messages. Hook output is delivered like any gateway reply and is recorded
+in canonical history. `/help` lists configured hook commands under
+"Custom commands" (sorted).
 
 Hooks run in the thread's queue like any other message: when the backend is
 mid-reply, a hook command waits for that turn to finish and runs afterward —

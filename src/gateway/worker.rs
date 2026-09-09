@@ -817,14 +817,17 @@ fn complete_job(ctx: &Ctx, job: &Job, reason: &str) {
 }
 
 /// Splits `/word args...` input into `(word, args)` for command routing.
-/// Returns `None` for anything that is not a slash command with a word.
+/// The word is split on any whitespace, so `/report\nagents` routes to the
+/// `report` hook like `/report agents` does. Returns `None` for anything
+/// that is not a slash command with a word.
 fn slash_command(text: &str) -> Option<(&str, &str)> {
     let rest = text.trim().strip_prefix('/')?;
+    let rest = rest.trim_start();
     if rest.is_empty() {
         return None;
     }
-    Some(match rest.split_once(' ') {
-        Some((word, args)) => (word, args.trim()),
+    Some(match rest.find(char::is_whitespace) {
+        Some(index) => (&rest[..index], rest[index..].trim()),
         None => (rest, ""),
     })
 }
@@ -835,82 +838,89 @@ fn slash_command(text: &str) -> Option<(&str, &str)> {
 /// slash commands fall through to the agent as before.
 async fn command(ctx: &Ctx, job: &Job) -> Option<String> {
     let (word, args) = slash_command(&job.text)?;
-    match word.to_lowercase().as_str() {
-        "clear" | "new" | "reset" => match ctx.store.lock().unwrap().rotate(
-            &job.thread,
-            job.backend.as_str(),
-            ctx.runners
-                .get(&job.backend)
-                .map(|r| r.initial_session_id())
-                .unwrap_or_default(),
-        ) {
-            Ok(()) => Some("Started a fresh conversation.".to_string()),
-            Err(_) => Some("Couldn't reset the conversation.".to_string()),
-        },
-        "help" => {
-            let mut text = "Commands:\n/clear - start a fresh conversation\n/stop - stop the active request\n/help - this message".to_string();
-            let mut names: Vec<&String> = ctx.cfg.command_hooks.keys().collect();
-            names.sort_unstable();
-            if !names.is_empty() {
-                let list = names
-                    .iter()
-                    .map(|n| format!("/{n}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                text.push_str(&format!("\n\nCustom commands: {list}"));
-            }
-            Some(text)
-        }
-        word => {
-            // A mapped command owns all its forms: args are appended to the
-            // command line as trailing positional parameters (argv-safe, no
-            // re-parsing). Command-shaped input stays deterministic by
-            // default — it never becomes prompt content.
-            let hook = ctx.cfg.command_hooks.get(word)?;
-            // Hook context env (same set the timeout hook documents):
-            // scripts like /session need to know which thread/session asked.
-            let session_id = ctx.store.lock().unwrap().peek_session_id(&job.thread);
-            let env = CommandHookEnv {
-                thread: job.thread.clone(),
-                backend: job.backend.as_str().to_string(),
-                row_id: job.row_id,
-                session_id,
-            };
-            // Keep the typing indicator alive for the whole hook run —
-            // status-report-class scripts take 10s+, Telegram's typing
-            // action expires in ~5s. Same refresh loop the agent run uses.
-            match ctx.channel.typing_refresh() {
-                Some(refresh) => {
-                    let channel = ctx.channel.clone();
-                    let target = job.target.clone();
-                    let thread = job.thread.clone();
-                    let log_thread = thread.clone();
-                    let env2 = env.clone();
-                    Some(
-                        run_with_periodic_activity(
-                            run_command_hook(hook, args, env2),
-                            refresh,
-                            move || {
-                                let channel = channel.clone();
-                                let target = target.clone();
-                                let thread = log_thread.clone();
-                                async move {
-                                    if let Err(e) = channel.send_typing(&target).await {
-                                        warn!("[{thread}] typing update failed: {e}");
-                                    }
-                                }
-                            },
-                        )
-                        .await,
-                    )
+    let lowered = word.to_lowercase();
+    // Built-ins match bare commands only: `/clear typo` reaches the backend
+    // unchanged, exactly as it did before hooks existed.
+    if args.is_empty() {
+        match lowered.as_str() {
+            "clear" | "new" | "reset" => match ctx.store.lock().unwrap().rotate(
+                &job.thread,
+                job.backend.as_str(),
+                ctx.runners
+                    .get(&job.backend)
+                    .map(|r| r.initial_session_id())
+                    .unwrap_or_default(),
+            ) {
+                Ok(()) => return Some("Started a fresh conversation.".to_string()),
+                Err(_) => return Some("Couldn't reset the conversation.".to_string()),
+            },
+            "help" => {
+                let mut text = "Commands:\n/clear - start a fresh conversation\n/stop - stop the active request\n/help - this message".to_string();
+                let mut names: Vec<&String> = ctx.cfg.command_hooks.keys().collect();
+                names.sort_unstable();
+                if !names.is_empty() {
+                    let list = names
+                        .iter()
+                        .map(|n| format!("/{n}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    text.push_str(&format!("\n\nCustom commands: {list}"));
                 }
-                None => Some(run_command_hook(hook, args, env).await),
+                return Some(text);
             }
+            _ => {}
         }
+    }
+    // A mapped command owns all its forms: args are appended to the
+    // command line as trailing positional parameters (argv-safe, no
+    // re-parsing). Command-shaped input stays deterministic by
+    // default — it never becomes prompt content.
+    let hook = ctx.cfg.command_hooks.get(lowered.as_str())?;
+    // Hook context env: scripts like /session need to know which
+    // thread/session/backend asked.
+    let session_id = ctx
+        .store
+        .lock()
+        .unwrap()
+        .peek_session_id(&job.thread, job.backend.as_str());
+    let env = CommandHookEnv {
+        thread: job.thread.clone(),
+        backend: job.backend.as_str().to_string(),
+        row_id: job.row_id,
+        session_id,
+    };
+    // Keep the typing indicator alive for the whole hook run —
+    // status-report-class scripts take 10s+, Telegram's typing
+    // action expires in ~5s. Same refresh loop the agent run uses.
+    match ctx.channel.typing_refresh() {
+        Some(refresh) => {
+            let channel = ctx.channel.clone();
+            let target = job.target.clone();
+            let thread = job.thread.clone();
+            let log_thread = thread.clone();
+            let env2 = env.clone();
+            Some(
+                run_with_periodic_activity(
+                    run_command_hook(hook, args, env2),
+                    refresh,
+                    move || {
+                        let channel = channel.clone();
+                        let target = target.clone();
+                        let thread = log_thread.clone();
+                        async move {
+                            if let Err(e) = channel.send_typing(&target).await {
+                                warn!("[{thread}] typing update failed: {e}");
+                            }
+                        }
+                    },
+                )
+                .await,
+            )
+        }
+        None => Some(run_command_hook(hook, args, env).await),
     }
 }
 
-/// Context passed to command hooks as environment variables.
 #[derive(Clone)]
 struct CommandHookEnv {
     thread: String,
@@ -936,8 +946,10 @@ impl CommandHookEnv {
 /// Runs a command hook through `/bin/sh`. The trimmed stdout is the reply;
 /// failures reply with a short deterministic error instead of falling back to
 /// the agent, so a broken hook never turns into a surprise LLM turn.
-/// Simpler than the timeout hook's runner (no process-group teardown, no
-/// stdout cap); unify with it if hooks ever leak backgrounded descendants.
+/// The hook runs in its own process group and every timeout/cap path signals
+/// the whole group, so backgrounded descendants die with the shell instead
+/// of leaking. stdout/stderr are read with byte caps — a runaway hook is
+/// bounded memory and a deterministic reply, never an OOM.
 async fn run_command_hook(hook: &str, args: &str, env: CommandHookEnv) -> String {
     // `sh -c "{hook} \"$@\"" sh <message args>`: the hook's own fixed args
     // come first, message args are appended to the same command line (argv,
@@ -951,31 +963,63 @@ async fn run_command_hook(hook: &str, args: &str, env: CommandHookEnv) -> String
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .output();
-    match tokio::time::timeout(Duration::from_secs(COMMAND_HOOK_TIMEOUT_SECS), child).await {
-        Err(_) => "Command hook timed out.".to_string(),
-        Ok(Err(error)) => format!("Command hook failed to run: {error}"),
-        Ok(Ok(output)) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stdout = if stdout.len() > COMMAND_HOOK_MAX_STDOUT {
-                &stdout[..COMMAND_HOOK_MAX_STDOUT]
-            } else {
-                &stdout
-            };
-            let stdout = stdout.trim().to_string();
-            if stdout.is_empty() {
-                "Command hook produced no output.".to_string()
-            } else {
-                stdout
-            }
+        .process_group(0)
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => return format!("Command hook failed to run: {error}"),
+    };
+    // Leader pid == process group id (process_group(0)); captured before the
+    // timeout scope so the expiry path can still signal the group after the
+    // future (and the Child) is dropped.
+    let pgid = child.id().expect("hook child alive before wait") as libc::pid_t;
+    let mut stdout_pipe = child.stdout.take().expect("hook stdout piped");
+    let mut stderr_pipe = child.stderr.take().expect("hook stderr piped");
+    let collect = async {
+        let (stdout, stderr) =
+            tokio::join!(read_capped(&mut stdout_pipe), read_capped(&mut stderr_pipe),);
+        let status = child.wait().await;
+        (stdout, stderr, status)
+    };
+    let result =
+        tokio::time::timeout(Duration::from_secs(COMMAND_HOOK_TIMEOUT_SECS), collect).await;
+    match result {
+        Err(_) => {
+            // kill_on_drop reaped the leader when the inner future dropped;
+            // the group signal takes care of any descendants it spawned.
+            kill_hook_group(pgid);
+            "Command hook timed out.".to_string()
         }
-        Ok(Ok(output)) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let stderr = truncate_chars(&stderr, 500);
-            if stderr.is_empty() {
-                format!("Command hook exited with {}", output.status)
-            } else {
-                format!("Command hook exited with {}: {stderr}", output.status)
+        Ok(((stdout, out_capped, out_error), (stderr, err_capped, err_error), status)) => {
+            if out_capped || err_capped {
+                // Stop the hook (and its descendants) so the pipes close;
+                // partial output beyond the cap is not delivered.
+                kill_hook_group(pgid);
+                return "Command hook output exceeded 64 KiB.".to_string();
+            }
+            if let Some(error) = out_error.or(err_error) {
+                warn!("[{}] command hook pipe read failed: {error}", env.thread);
+                return "Command hook failed: output could not be read.".to_string();
+            }
+            match status {
+                Err(error) => format!("Command hook failed to run: {error}"),
+                Ok(status) if status.success() => {
+                    let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
+                    if stdout.is_empty() {
+                        "Command hook produced no output.".to_string()
+                    } else {
+                        stdout
+                    }
+                }
+                Ok(status) => {
+                    let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+                    let stderr = truncate_chars(&stderr, 500);
+                    if stderr.is_empty() {
+                        format!("Command hook exited with {status}")
+                    } else {
+                        format!("Command hook exited with {status}: {stderr}")
+                    }
+                }
             }
         }
     }
@@ -983,6 +1027,46 @@ async fn run_command_hook(hook: &str, args: &str, env: CommandHookEnv) -> String
 
 const COMMAND_HOOK_TIMEOUT_SECS: u64 = 15;
 const COMMAND_HOOK_MAX_STDOUT: usize = 64 * 1024; // same cap the timeout hook applies
+
+/// SIGKILLs the hook's whole process group (negative pid). Covers the shell
+/// leader and any backgrounded descendants — kill_on_drop only ever signals
+/// the leader. Errors are ignored: the group may already be gone.
+fn kill_hook_group(pgid: libc::pid_t) {
+    // Safety: signal syscall with an integer pid; no pointers involved.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+}
+
+/// Reads a pipe with a byte cap, returning the bytes, whether the cap was
+/// exceeded, and the first read error (if any). A read error is not EOF:
+/// partial output from a failing pipe is a hook failure.
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+) -> (Vec<u8>, bool, Option<std::io::Error>) {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut capped = false;
+    let mut read_error = None;
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if buf.len() + n > COMMAND_HOOK_MAX_STDOUT {
+                    capped = true;
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(error) => {
+                read_error = Some(error);
+                break;
+            }
+        }
+    }
+    (buf, capped, read_error)
+}
 
 fn truncate_chars(text: &str, max: usize) -> &str {
     match text.char_indices().nth(max) {

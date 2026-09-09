@@ -247,6 +247,7 @@ impl Config {
             ],
         )?;
         let mut c: Config = value.try_into().context("parse TOML config")?;
+        validate_command_hooks(&mut c.command_hooks)?;
         let config_path = std::fs::canonicalize(&expanded_path)
             .with_context(|| format!("resolve config {expanded_path}"))?;
         c.db_path = expand_home(&c.db_path);
@@ -868,6 +869,43 @@ impl AgentBackend {
     }
 }
 
+/// Names of the built-in gateway commands; hooks may not shadow them.
+const BUILTIN_COMMANDS: &[&str] = &["clear", "new", "reset", "help", "stop"];
+
+/// Normalizes hook names to lowercase and rejects names the dispatcher can
+/// never reach: empty, whitespace or path separators, or shadowing a built-in.
+/// Dispatch lowercases the incoming command, so an uppercase config key would
+/// be accepted but unreachable, and `/help` would advertise it.
+fn validate_command_hooks(hooks: &mut HashMap<String, String>) -> Result<()> {
+    let mut normalized = HashMap::with_capacity(hooks.len());
+    for (name, command) in std::mem::take(hooks) {
+        if command.trim().is_empty() {
+            bail!("command_hooks.{name}: command must not be empty");
+        }
+        let lowered = name.to_lowercase();
+        if lowered.is_empty()
+            || !lowered
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            bail!(
+                "command_hooks.{name}: names must be ASCII letters, digits, '-' or '_' (no whitespace or slashes)"
+            );
+        }
+        if BUILTIN_COMMANDS.contains(&lowered.as_str()) {
+            bail!("command_hooks.{name}: \"/{lowered}\" is a built-in command and cannot be overridden");
+        }
+        if normalized.contains_key(&lowered) {
+            bail!(
+                "command_hooks.{name}: duplicate after case-normalization — \"/{lowered}\" is already defined"
+            );
+        }
+        normalized.insert(lowered, command);
+    }
+    *hooks = normalized;
+    Ok(())
+}
+
 fn default_db_path() -> String {
     "~/Library/Messages/chat.db".to_string()
 }
@@ -1052,5 +1090,34 @@ mod tests {
         assert!(error.to_string().contains("not a symlink"));
         let _ = std::fs::remove_dir_all(assistant);
         let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn command_hooks_normalize_names_and_reject_collisions() {
+        let mut hooks = HashMap::new();
+        hooks.insert("Status".to_string(), "echo ok".to_string());
+        validate_command_hooks(&mut hooks).unwrap();
+        assert!(hooks.contains_key("status"));
+        assert!(!hooks.contains_key("Status"));
+
+        let mut hooks = HashMap::new();
+        hooks.insert("Report".to_string(), "echo a".to_string());
+        hooks.insert("report".to_string(), "echo b".to_string());
+        let error = validate_command_hooks(&mut hooks).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("duplicate after case-normalization"));
+    }
+
+    #[test]
+    fn command_hooks_reject_whitespace_names_and_builtins() {
+        let mut hooks = HashMap::new();
+        hooks.insert("bad name".to_string(), "echo hi".to_string());
+        assert!(validate_command_hooks(&mut hooks).is_err());
+
+        let mut hooks = HashMap::new();
+        hooks.insert("clear".to_string(), "echo hi".to_string());
+        let error = validate_command_hooks(&mut hooks).unwrap_err();
+        assert!(error.to_string().contains("built-in"));
     }
 }
