@@ -895,6 +895,7 @@ mod tests {
                 document: None,
                 voice: None,
                 message_thread_id: None,
+                message_id: 1,
             }),
         }
         .into_raw();
@@ -926,6 +927,7 @@ mod tests {
                     mime_type: Some("audio/ogg".to_string()),
                 }),
                 message_thread_id: None,
+                message_id: 1,
             }),
         }
         .into_raw();
