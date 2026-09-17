@@ -263,6 +263,15 @@ impl Telegram {
     }
 
     pub async fn send_rich(&self, target: &str, text: &str) -> Result<()> {
+        self.send_rich_reply(target, text, None).await
+    }
+
+    pub async fn send_rich_reply(
+        &self,
+        target: &str,
+        text: &str,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<()> {
         if text.encode_utf16().count() > TEXT_LIMIT {
             bail!("Telegram rich message exceeds the {TEXT_LIMIT} character chunk limit");
         }
@@ -270,6 +279,9 @@ impl Telegram {
         let mut payload = target_payload(target);
         payload["text"] = json!(html);
         payload["parse_mode"] = json!("HTML");
+        if let Some(id) = reply_to_message_id {
+            payload["reply_parameters"] = json!({"message_id": id, "allow_sending_without_reply": true});
+        }
         let transport_response = self
             .post_with_topic_fallback("sendMessage", payload)
             .await?;
@@ -285,8 +297,20 @@ impl Telegram {
     }
 
     pub async fn send_plain(&self, target: &str, text: &str) -> Result<()> {
+        self.send_plain_reply(target, text, None).await
+    }
+
+    pub async fn send_plain_reply(
+        &self,
+        target: &str,
+        text: &str,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<()> {
         let mut payload = target_payload(target);
         payload["text"] = json!(text);
+        if let Some(id) = reply_to_message_id {
+            payload["reply_parameters"] = json!({"message_id": id, "allow_sending_without_reply": true});
+        }
         let transport_response = self
             .post_with_topic_fallback("sendMessage", payload)
             .await?;
@@ -517,6 +541,7 @@ impl Update {
                 is_from_me: false,
                 is_supported: false,
                 thread_id: None,
+                reply_to_message_id: None,
             };
         };
         let images = message
@@ -572,6 +597,7 @@ impl Update {
             is_from_me: false,
             is_supported: true,
             thread_id: message.message_thread_id,
+            reply_to_message_id: message.message_id,
         }
     }
 }
@@ -581,6 +607,8 @@ struct TelegramMessage {
     #[serde(default)]
     from: Option<User>,
     chat: Chat,
+    #[serde(default)]
+    message_id: Option<i64>,
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]

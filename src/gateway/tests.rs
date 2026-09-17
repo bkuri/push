@@ -166,6 +166,7 @@ fn msg(chat: &str, handle: &str, from_me: bool, text: &str) -> RawMessage {
         is_from_me: from_me,
         is_group: false,
         is_supported: true,
+        reply_to_message_id: None,
         thread_id: None,
     }
 }
@@ -4096,6 +4097,7 @@ fn message(row_id: i64, chat: &str, handle: &str, is_from_me: bool, text: &str) 
         is_from_me,
         is_group: false,
         is_supported: true,
+        reply_to_message_id: None,
         thread_id: None,
     }
 }
@@ -4119,6 +4121,7 @@ fn telegram_message(
         is_from_me: false,
         is_group,
         is_supported: true,
+        reply_to_message_id: None,
         thread_id: None,
     }
 }
@@ -4173,6 +4176,7 @@ fn slack_image_message(
         is_from_me: false,
         is_group: false,
         is_supported: true,
+        reply_to_message_id: None,
         thread_id: None,
     }
 }

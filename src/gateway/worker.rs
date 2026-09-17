@@ -848,6 +848,7 @@ pub(super) async fn record_and_deliver(
     origin: OutboundOrigin,
     text: &str,
 ) -> Result<DeliveryOutcome> {
+    *ctx.telegram_reply_anchor.lock().unwrap() = job.telegram_reply_anchor;
     let outbound = ctx.history.lock().unwrap().record_outbound(
         job.inbound_id,
         origin,
@@ -962,7 +963,7 @@ async fn deliver_outbound_once(
         .enumerate()
         .skip(outbound.delivery_chunk_index)
     {
-        if let Err(error) = super::send_reply_chunk(ctx, target, chunk).await {
+        if let Err(error) = super::send_reply_chunk(ctx, target, &mut chunk.clone()).await {
             error!(
                 "outbound {} chunk {index} send error to {target}: {error}",
                 outbound.id

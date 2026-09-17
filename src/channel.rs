@@ -55,6 +55,9 @@ pub struct RawMessage {
     pub is_supported: bool,
     /// Channel-specific thread/topic id (Telegram `message_thread_id`).
     pub thread_id: Option<i64>,
+    /// Provider message id of the inbound message (Telegram `message_id`),
+    /// used to anchor replies via `reply_parameters`.
+    pub reply_to_message_id: Option<i64>,
 }
 
 impl RawMessage {
@@ -70,6 +73,8 @@ impl RawMessage {
 pub struct OutboundChunk {
     pub text: String,
     pub rich_markdown: bool,
+    /// Telegram message id to reply to (anchoring), when known.
+    pub reply_to_message_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,6 +427,7 @@ impl ChannelContract for IMessageChannel {
                     .collect(),
                 is_from_me: message.is_from_me,
                 is_supported: true,
+                reply_to_message_id: None,
                 thread_id: None,
             })
             .collect())
@@ -638,9 +644,9 @@ impl ChannelContract for Telegram {
 
     async fn send_chunk(&self, target: &str, chunk: &OutboundChunk) -> Result<()> {
         if chunk.rich_markdown {
-            self.send_rich(target, &chunk.text).await
+            self.send_rich_reply(target, &chunk.text, chunk.reply_to_message_id).await
         } else {
-            self.send_plain(target, &chunk.text).await
+            self.send_plain_reply(target, &chunk.text, chunk.reply_to_message_id).await
         }
     }
 
@@ -883,6 +889,7 @@ mod tests {
             images: Vec::new(),
             is_from_me,
             is_supported: true,
+            reply_to_message_id: None,
             thread_id: None,
         }
     }
@@ -900,6 +907,7 @@ mod tests {
             images: Vec::new(),
             is_from_me: false,
             is_supported: true,
+            reply_to_message_id: None,
             thread_id: None,
         }
     }
@@ -995,6 +1003,7 @@ mod tests {
             images: Vec::new(),
             is_from_me: false,
             is_supported: true,
+            reply_to_message_id: None,
             thread_id: None,
         };
 

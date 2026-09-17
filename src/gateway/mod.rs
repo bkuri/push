@@ -44,6 +44,8 @@ struct Job {
     voice_attachment: Option<InboundVoice>,
     image_attachments: Vec<InboundImage>,
     approval_origin: AnswerOrigin,
+    /// Telegram message id of the trigger message (reply anchoring).
+    telegram_reply_anchor: Option<i64>,
 }
 
 /// Shared, cheaply cloneable context handed to each worker task.
@@ -61,6 +63,8 @@ struct Ctx {
     audit: Arc<AuditLog>,
     voice: Option<Voice>,
     schedule_destination: Option<PrimaryDestination>,
+    /// Telegram message id to anchor replies to, set by the worker per turn.
+    telegram_reply_anchor: Arc<Mutex<Option<i64>>>,
     #[cfg(test)]
     setup_failure_replies: Arc<Mutex<Vec<String>>>,
     #[cfg(test)]
@@ -412,6 +416,7 @@ impl Gateway {
             channel: channel.clone(),
             run_timeout: cfg.run_timeout_dur()?,
             reply_marker: crate::channel::REPLY_MARKER.to_string(),
+            telegram_reply_anchor: Arc::new(Mutex::new(None)),
             assistant_dir: cfg.assistant_dir.clone(),
             audit,
             schedule_destination: None,
@@ -900,6 +905,7 @@ impl Gateway {
                     voice_attachment: m.voice.clone(),
                     image_attachments: m.images.clone(),
                     approval_origin,
+                    telegram_reply_anchor: m.reply_to_message_id,
                 };
                 if job.image_attachments.is_empty() && job.text.trim().eq_ignore_ascii_case("/stop")
                 {
@@ -1231,7 +1237,7 @@ async fn reply_to(ctx: &Ctx, target: &str, text: &str) -> bool {
         return false;
     }
     for chunk in chunks {
-        if let Err(error) = send_reply_chunk(ctx, target, &chunk).await {
+        if let Err(error) = send_reply_chunk(ctx, target, &mut chunk.clone()).await {
             error!("send error to {target}: {error}");
             return false;
         }
@@ -1242,7 +1248,7 @@ async fn reply_to(ctx: &Ctx, target: &str, text: &str) -> bool {
 async fn send_reply_chunk(
     ctx: &Ctx,
     target: &str,
-    chunk: &crate::channel::OutboundChunk,
+    chunk: &mut crate::channel::OutboundChunk,
 ) -> Result<()> {
     #[cfg(test)]
     {
@@ -1277,6 +1283,7 @@ async fn send_reply_chunk(
     }
     #[cfg(not(test))]
     {
+        chunk.reply_to_message_id = *ctx.telegram_reply_anchor.lock().unwrap();
         let timeout = ctx.channel.delivery_semantics().send_timeout;
         if timeout.is_zero() {
             ctx.channel.send_chunk(target, chunk).await
@@ -1325,7 +1332,7 @@ async fn send_scheduled_chunk(
     target: &str,
     chunk: &crate::channel::OutboundChunk,
 ) -> Result<()> {
-    send_reply_chunk(ctx, target, chunk).await
+    send_reply_chunk(ctx, target, &mut chunk.clone()).await
 }
 
 fn complete_row(store: &Arc<Mutex<Store>>, ack: &Arc<Mutex<AckState>>, channel: &str, row_id: i64) {
