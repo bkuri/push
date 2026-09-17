@@ -646,9 +646,11 @@ impl ChannelContract for Telegram {
 
     async fn send_chunk(&self, target: &str, chunk: &OutboundChunk) -> Result<()> {
         if chunk.rich_markdown {
-            self.send_rich_reply(target, &chunk.text, chunk.reply_to_message_id).await
+            self.send_rich_reply(target, &chunk.text, chunk.reply_to_message_id)
+                .await
         } else {
-            self.send_plain_reply(target, &chunk.text, chunk.reply_to_message_id).await
+            self.send_plain_reply(target, &chunk.text, chunk.reply_to_message_id)
+                .await
         }
     }
 

@@ -576,8 +576,13 @@ async fn review_changed_schedules(ctx: &Ctx, job: &Job) {
     };
     audit_schedule_events(ctx, &mut ledger);
     for question in questions {
-        let delivered =
-            super::reply_to(ctx, &question.target, &question.render_correlated_text()).await;
+        let delivered = super::reply_to(
+            ctx,
+            &question.target,
+            &question.render_correlated_text(),
+            None,
+        )
+        .await;
         if let Err(error) = ledger.mark_schedule_question_delivery(
             &question.id,
             if delivered {
@@ -848,7 +853,6 @@ pub(super) async fn record_and_deliver(
     origin: OutboundOrigin,
     text: &str,
 ) -> Result<DeliveryOutcome> {
-    *ctx.telegram_reply_anchor.lock().unwrap() = job.telegram_reply_anchor;
     let outbound = ctx.history.lock().unwrap().record_outbound(
         job.inbound_id,
         origin,
@@ -875,7 +879,8 @@ pub(super) async fn record_and_deliver_once(
     if outbound.status == DeliveryStatus::Delivered {
         return Ok(true);
     }
-    let delivered = deliver_outbound_once(ctx, &job.target, &mut outbound).await?;
+    let delivered =
+        deliver_outbound_once(ctx, &job.target, job.telegram_reply_anchor, &mut outbound).await?;
     ctx.history.lock().unwrap().mark_delivery(
         outbound.id,
         if delivered {
@@ -900,7 +905,9 @@ async fn deliver_stored(
     let mut attempt = 0;
     loop {
         attempt += 1;
-        let delivered = deliver_outbound_once(ctx, &job.target, &mut outbound).await?;
+        let delivered =
+            deliver_outbound_once(ctx, &job.target, job.telegram_reply_anchor, &mut outbound)
+                .await?;
         let status = if delivered {
             DeliveryStatus::Delivered
         } else {
@@ -945,6 +952,7 @@ async fn deliver_stored(
 async fn deliver_outbound_once(
     ctx: &Ctx,
     target: &str,
+    reply_anchor: Option<i64>,
     outbound: &mut OutboundMessage,
 ) -> Result<bool> {
     let chunks = ctx
@@ -963,7 +971,7 @@ async fn deliver_outbound_once(
         .enumerate()
         .skip(outbound.delivery_chunk_index)
     {
-        if let Err(error) = super::send_reply_chunk(ctx, target, &mut chunk.clone()).await {
+        if let Err(error) = super::send_reply_chunk(ctx, target, reply_anchor, chunk).await {
             error!(
                 "outbound {} chunk {index} send error to {target}: {error}",
                 outbound.id

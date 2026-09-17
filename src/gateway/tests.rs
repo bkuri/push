@@ -208,7 +208,6 @@ fn setup_failure_ctx(
         .unwrap();
     assert_eq!(inbound_id, 1);
     Ctx {
-        telegram_reply_anchor: std::sync::Arc::new(std::sync::Mutex::new(None)),
         cfg: test_config(
             &temp_path("setup-failure-state").to_string_lossy(),
             &temp_path("setup-failure-sessions").to_string_lossy(),
@@ -399,7 +398,7 @@ async fn delivery_fails_when_channel_produces_no_chunks() {
     ))
     .unwrap();
 
-    assert!(!reply_to(&gateway.ctx, "me@icloud.com", " \t\n ").await);
+    assert!(!reply_to(&gateway.ctx, "me@icloud.com", " \t\n ", None).await);
     assert!(gateway.ctx.sent_replies.lock().unwrap().is_empty());
 
     let checkpoints = Arc::new(Mutex::new(Vec::new()));

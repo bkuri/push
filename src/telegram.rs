@@ -280,7 +280,8 @@ impl Telegram {
         payload["text"] = json!(html);
         payload["parse_mode"] = json!("HTML");
         if let Some(id) = reply_to_message_id {
-            payload["reply_parameters"] = json!({"message_id": id, "allow_sending_without_reply": true});
+            payload["reply_parameters"] =
+                json!({"message_id": id, "allow_sending_without_reply": true});
         }
         let transport_response = self
             .post_with_topic_fallback("sendMessage", payload)
@@ -309,7 +310,8 @@ impl Telegram {
         let mut payload = target_payload(target);
         payload["text"] = json!(text);
         if let Some(id) = reply_to_message_id {
-            payload["reply_parameters"] = json!({"message_id": id, "allow_sending_without_reply": true});
+            payload["reply_parameters"] =
+                json!({"message_id": id, "allow_sending_without_reply": true});
         }
         let transport_response = self
             .post_with_topic_fallback("sendMessage", payload)
@@ -845,6 +847,29 @@ mod tests {
         assert!(!messages[2].is_supported);
         assert_eq!(messages[3].thread_id, Some(99));
         assert!(!messages[3].is_group);
+    }
+
+    #[tokio::test]
+    async fn replies_carry_reply_parameters_only_when_anchored() {
+        let ok = json!({"ok": true, "result": {"message_id": 5}});
+        let fake = Arc::new(FakeTransport::with_responses(vec![ok.clone(), ok]));
+        let telegram =
+            Telegram::with_transport("secret".to_string(), vec![7], vec![], fake.clone());
+
+        telegram.send_plain("chat", "hi").await.unwrap();
+        telegram
+            .send_plain_reply("chat", "hi", Some(41))
+            .await
+            .unwrap();
+
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].1.get("reply_parameters").is_none());
+        assert_eq!(calls[1].1["reply_parameters"]["message_id"], 41);
+        assert_eq!(
+            calls[1].1["reply_parameters"]["allow_sending_without_reply"],
+            true
+        );
     }
 
     #[tokio::test]

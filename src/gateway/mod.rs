@@ -63,8 +63,6 @@ struct Ctx {
     audit: Arc<AuditLog>,
     voice: Option<Voice>,
     schedule_destination: Option<PrimaryDestination>,
-    /// Telegram message id to anchor replies to, set by the worker per turn.
-    telegram_reply_anchor: Arc<Mutex<Option<i64>>>,
     #[cfg(test)]
     setup_failure_replies: Arc<Mutex<Vec<String>>>,
     #[cfg(test)]
@@ -212,7 +210,7 @@ impl GatewayGroup {
             .iter()
             .find(|gateway| gateway.channel.id() == destination.channel)
             .context("resolved primary delivery channel is unavailable")?;
-        if !reply_to(&gateway.ctx, &destination.target, text).await {
+        if !reply_to(&gateway.ctx, &destination.target, text, None).await {
             anyhow::bail!(
                 "primary delivery to {} target {:?} failed",
                 destination.channel,
@@ -416,7 +414,6 @@ impl Gateway {
             channel: channel.clone(),
             run_timeout: cfg.run_timeout_dur()?,
             reply_marker: crate::channel::REPLY_MARKER.to_string(),
-            telegram_reply_anchor: Arc::new(Mutex::new(None)),
             assistant_dir: cfg.assistant_dir.clone(),
             audit,
             schedule_destination: None,
@@ -460,7 +457,7 @@ impl Gateway {
             .lock()
             .unwrap()
             .create_question(&question, now_ms())?;
-        let delivered = reply_to(&self.ctx, &question.target, &question.render_text()).await;
+        let delivered = reply_to(&self.ctx, &question.target, &question.render_text(), None).await;
         self.ctx.history.lock().unwrap().mark_question_delivery(
             &id,
             if delivered {
@@ -792,7 +789,9 @@ impl Gateway {
                             | jobs::ScheduleDecision::NotScheduleReview => None,
                         };
                         if let Some(confirmation) = confirmation {
-                            if !reply_to(&self.ctx, &target, &confirmation).await {
+                            if !reply_to(&self.ctx, &target, &confirmation, m.reply_to_message_id)
+                                .await
+                            {
                                 warn!("[{thread}] schedule review confirmation delivery failed");
                             }
                         }
@@ -829,6 +828,7 @@ impl Gateway {
                                 &self.ctx,
                                 &target,
                                 "Job approval is no longer used. Ask me to create the job again and I will write it directly to the assistant repository.",
+                                m.reply_to_message_id,
                             )
                             .await
                         {
@@ -1230,14 +1230,14 @@ fn audit_schedule_events(ctx: &Ctx, ledger: &mut jobs::Ledger) {
     }
 }
 
-async fn reply_to(ctx: &Ctx, target: &str, text: &str) -> bool {
+async fn reply_to(ctx: &Ctx, target: &str, text: &str, reply_anchor: Option<i64>) -> bool {
     let chunks = ctx.channel.outbound_chunks(text, &ctx.reply_marker);
     if chunks.is_empty() {
         error!("send error to {target}: channel produced no outbound chunks");
         return false;
     }
     for chunk in chunks {
-        if let Err(error) = send_reply_chunk(ctx, target, &mut chunk.clone()).await {
+        if let Err(error) = send_reply_chunk(ctx, target, reply_anchor, &chunk).await {
             error!("send error to {target}: {error}");
             return false;
         }
@@ -1245,10 +1245,12 @@ async fn reply_to(ctx: &Ctx, target: &str, text: &str) -> bool {
     true
 }
 
+#[cfg_attr(test, allow(unused_variables))]
 async fn send_reply_chunk(
     ctx: &Ctx,
     target: &str,
-    chunk: &mut crate::channel::OutboundChunk,
+    reply_anchor: Option<i64>,
+    chunk: &crate::channel::OutboundChunk,
 ) -> Result<()> {
     #[cfg(test)]
     {
@@ -1283,12 +1285,13 @@ async fn send_reply_chunk(
     }
     #[cfg(not(test))]
     {
-        chunk.reply_to_message_id = *ctx.telegram_reply_anchor.lock().unwrap();
+        let mut chunk = chunk.clone();
+        chunk.reply_to_message_id = reply_anchor;
         let timeout = ctx.channel.delivery_semantics().send_timeout;
         if timeout.is_zero() {
-            ctx.channel.send_chunk(target, chunk).await
+            ctx.channel.send_chunk(target, &chunk).await
         } else {
-            match tokio::time::timeout(timeout, ctx.channel.send_chunk(target, chunk)).await {
+            match tokio::time::timeout(timeout, ctx.channel.send_chunk(target, &chunk)).await {
                 Ok(result) => result,
                 Err(_) => anyhow::bail!("send timed out"),
             }
@@ -1332,7 +1335,7 @@ async fn send_scheduled_chunk(
     target: &str,
     chunk: &crate::channel::OutboundChunk,
 ) -> Result<()> {
-    send_reply_chunk(ctx, target, &mut chunk.clone()).await
+    send_reply_chunk(ctx, target, None, chunk).await
 }
 
 fn complete_row(store: &Arc<Mutex<Store>>, ack: &Arc<Mutex<AckState>>, channel: &str, row_id: i64) {
