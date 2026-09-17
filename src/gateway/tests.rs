@@ -208,6 +208,7 @@ fn setup_failure_ctx(
         .unwrap();
     assert_eq!(inbound_id, 1);
     Ctx {
+        telegram_reply_anchor: std::sync::Arc::new(std::sync::Mutex::new(None)),
         cfg: test_config(
             &temp_path("setup-failure-state").to_string_lossy(),
             &temp_path("setup-failure-sessions").to_string_lossy(),
@@ -240,6 +241,7 @@ fn setup_failure_ctx(
 
 fn setup_failure_job(row_id: i64) -> Job {
     Job {
+        telegram_reply_anchor: None,
         row_id,
         inbound_id: 1,
         thread: "imessage:self:me".to_string(),
@@ -2787,6 +2789,7 @@ async fn closed_worker_queue_is_recovered_without_another_message() {
         .unwrap();
     gateway.ack.lock().unwrap().in_flight.insert(1);
     let lost_job = Job {
+        telegram_reply_anchor: None,
         row_id: 1,
         inbound_id: lost_inbound_id,
         thread: thread.to_string(),
@@ -3097,6 +3100,7 @@ async fn stop_targets_the_current_row_ahead_of_retained_failures() {
     .unwrap();
     let thread = "imessage:self:me@icloud.com";
     let make_job = |row_id, inbound_id, text: &str| Job {
+        telegram_reply_anchor: None,
         row_id,
         inbound_id,
         thread: thread.to_string(),

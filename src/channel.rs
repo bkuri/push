@@ -521,6 +521,7 @@ impl ChannelContract for IMessageChannel {
             Vec::new()
         } else {
             vec![OutboundChunk {
+                reply_to_message_id: None,
                 text: format!("{text}{marker}"),
                 rich_markdown: false,
             }]
@@ -636,6 +637,7 @@ impl ChannelContract for Telegram {
         crate::telegram::split_text(text)
             .into_iter()
             .map(|text| OutboundChunk {
+                reply_to_message_id: None,
                 text,
                 rich_markdown: true,
             })
@@ -742,6 +744,7 @@ impl ChannelContract for Slack {
         crate::slack::split_text(&crate::markdown::to_slack_mrkdwn_for_chunking(text))
             .into_iter()
             .map(|text| OutboundChunk {
+                reply_to_message_id: None,
                 text,
                 rich_markdown: true,
             })
@@ -947,6 +950,7 @@ mod tests {
         assert_eq!(
             channel.outbound_chunks("reply", REPLY_MARKER),
             [OutboundChunk {
+                reply_to_message_id: None,
                 text: format!("reply{REPLY_MARKER}"),
                 rich_markdown: false,
             }]
@@ -982,6 +986,7 @@ mod tests {
         assert_eq!(
             channel.outbound_chunks("reply", REPLY_MARKER),
             [OutboundChunk {
+                reply_to_message_id: None,
                 text: "reply".to_string(),
                 rich_markdown: true,
             }]
