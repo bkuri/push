@@ -544,6 +544,7 @@ impl Update {
                 is_supported: false,
                 thread_id: None,
                 reply_to_message_id: None,
+                reply_context: None,
             };
         };
         let images = message
@@ -600,8 +601,24 @@ impl Update {
             is_supported: true,
             thread_id: message.message_thread_id,
             reply_to_message_id: message.message_id,
+            reply_context: message
+                .reply_to_message
+                .as_deref()
+                .and_then(|replied| replied.text.as_deref().or(replied.caption.as_deref()))
+                .map(reply_excerpt),
         }
     }
+}
+
+/// Flattens a replied-to message to one line, capped so a long quote cannot
+/// dominate the prompt.
+fn reply_excerpt(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut excerpt: String = flat.chars().take(200).collect();
+    if flat.chars().count() > 200 {
+        excerpt.push('…');
+    }
+    excerpt
 }
 
 #[derive(Deserialize)]
@@ -623,6 +640,8 @@ struct TelegramMessage {
     voice: Option<TelegramVoice>,
     #[serde(default)]
     message_thread_id: Option<i64>,
+    #[serde(default)]
+    reply_to_message: Option<Box<TelegramMessage>>,
 }
 
 #[derive(Deserialize)]
@@ -849,6 +868,35 @@ mod tests {
         assert!(!messages[3].is_group);
     }
 
+    #[test]
+    fn parses_reply_to_message_into_flattened_excerpt() {
+        let long = "word ".repeat(80).trim_end().to_string();
+        let update: Update = serde_json::from_value(json!({
+            "update_id": 9,
+            "message": {
+                "message_id": 20,
+                "from": {"id": 7},
+                "chat": {"id": 7, "type": "private"},
+                "text": "now do the other thing",
+                "reply_to_message": {
+                    "message_id": 19,
+                    "from": {"id": 99},
+                    "chat": {"id": 7, "type": "private"},
+                    "text": format!("first line\nsecond line {long}")
+                }
+            }
+        }))
+        .unwrap();
+
+        let message = update.into_raw();
+
+        let quoted = message.reply_context.unwrap();
+        assert!(!quoted.contains('\n'));
+        assert!(quoted.starts_with("first line second line word"));
+        assert!(quoted.ends_with('…'));
+        assert_eq!(quoted.chars().count(), 201);
+    }
+
     #[tokio::test]
     async fn replies_carry_reply_parameters_only_when_anchored() {
         let ok = json!({"ok": true, "result": {"message_id": 5}});
@@ -921,6 +969,7 @@ mod tests {
                 voice: None,
                 message_thread_id: None,
                 message_id: Some(1),
+                reply_to_message: None,
             }),
         }
         .into_raw();
@@ -953,6 +1002,7 @@ mod tests {
                 }),
                 message_thread_id: None,
                 message_id: Some(1),
+                reply_to_message: None,
             }),
         }
         .into_raw();

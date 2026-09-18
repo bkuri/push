@@ -396,6 +396,7 @@ mod tests {
             is_from_me: false,
             is_supported: true,
             reply_to_message_id: None,
+            reply_context: None,
             thread_id: None,
         }
     }

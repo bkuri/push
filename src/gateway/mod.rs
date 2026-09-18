@@ -894,21 +894,28 @@ impl Gateway {
                     "[{thread}] new message accepted; routing to {}",
                     backend.as_str()
                 );
+                // The reply quote is context for the backend only: approval
+                // answer matching and the /stop check below must see the raw
+                // user text.
+                let is_stop =
+                    m.images.is_empty() && message_text.trim().eq_ignore_ascii_case("/stop");
                 let job = Job {
                     row_id: m.row_id,
                     inbound_id,
                     thread,
                     target,
                     backend,
-                    text: message_text,
+                    text: match &m.reply_context {
+                        Some(quoted) => format!("> {quoted}\n{message_text}"),
+                        None => message_text,
+                    },
                     reply_with_voice,
                     voice_attachment: m.voice.clone(),
                     image_attachments: m.images.clone(),
                     approval_origin,
                     telegram_reply_anchor: m.reply_to_message_id,
                 };
-                if job.image_attachments.is_empty() && job.text.trim().eq_ignore_ascii_case("/stop")
-                {
+                if is_stop {
                     if !self.stop(job).await {
                         return;
                     }

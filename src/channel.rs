@@ -58,6 +58,9 @@ pub struct RawMessage {
     /// Provider message id of the inbound message (Telegram `message_id`),
     /// used to anchor replies via `reply_parameters`.
     pub reply_to_message_id: Option<i64>,
+    /// Flattened excerpt of the message the user replied to (Telegram
+    /// `reply_to_message`), prefixed to the backend prompt. None elsewhere.
+    pub reply_context: Option<String>,
 }
 
 impl RawMessage {
@@ -428,6 +431,7 @@ impl ChannelContract for IMessageChannel {
                 is_from_me: message.is_from_me,
                 is_supported: true,
                 reply_to_message_id: None,
+                reply_context: None,
                 thread_id: None,
             })
             .collect())
@@ -895,6 +899,7 @@ mod tests {
             is_from_me,
             is_supported: true,
             reply_to_message_id: None,
+            reply_context: None,
             thread_id: None,
         }
     }
@@ -913,6 +918,7 @@ mod tests {
             is_from_me: false,
             is_supported: true,
             reply_to_message_id: None,
+            reply_context: None,
             thread_id: None,
         }
     }
@@ -1011,6 +1017,7 @@ mod tests {
             is_from_me: false,
             is_supported: true,
             reply_to_message_id: None,
+            reply_context: None,
             thread_id: None,
         };
 
