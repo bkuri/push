@@ -10,7 +10,7 @@ use crate::approval::{parse_answer, AnswerOrigin, AnswerOutcome, NormalizedAnswe
 #[cfg(test)]
 use crate::approval::{DeliveryStatus as ApprovalDeliveryStatus, Question, QuestionState};
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 const RETIRED_JOB_APPROVAL_ERROR: &str = "job approval was removed; request direct job creation";
 const MAX_HISTORY_READ_BYTES: usize = 8 * 1024;
 const READ_TRUNCATED: &str = "\n[truncated by push while reading history]";
@@ -115,6 +115,7 @@ impl History {
         thread_key: &str,
         channel_event_id: &str,
         content: &str,
+        provider_message_ref: Option<&str>,
     ) -> Result<i64> {
         let database_path = self.path.display().to_string();
         let tx = self
@@ -125,10 +126,15 @@ impl History {
         tx.execute(
             "INSERT INTO messages (
                 conversation_id, direction, origin, content, channel_event_id,
-                generation_status, delivery_status
-             ) VALUES (?1, 'inbound', 'channel', ?2, ?3, 'received', 'not_applicable')
+                provider_message_ref, generation_status, delivery_status
+             ) VALUES (?1, 'inbound', 'channel', ?2, ?3, ?4, 'received', 'not_applicable')
              ON CONFLICT(channel_event_id) DO NOTHING",
-            params![conversation_id, content, channel_event_id],
+            params![
+                conversation_id,
+                content,
+                channel_event_id,
+                provider_message_ref
+            ],
         )
         .with_context(|| format!("insert inbound message into {database_path}"))?;
         let id = tx
@@ -220,6 +226,25 @@ impl History {
             bail!("inbound message {inbound_id} does not exist");
         }
         Ok(())
+    }
+
+    /// Finds the inbound row for a provider message reference
+    /// (`channel:chat:message_id`), used to route `edited_message` updates.
+    pub fn inbound_id_for_provider_ref(&self, provider_message_ref: &str) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM messages
+                 WHERE provider_message_ref = ?1 AND direction = 'inbound'",
+                [provider_message_ref],
+                |row| row.get(0),
+            )
+            .optional()
+            .with_context(|| {
+                format!(
+                    "read inbound message by provider ref from {}",
+                    self.path.display()
+                )
+            })
     }
 
     pub fn outbound_for(&self, inbound_id: i64) -> Result<Option<OutboundMessage>> {
@@ -964,6 +989,14 @@ fn migrate(conn: &Connection) -> Result<()> {
              PRAGMA user_version = 14;",
         )?;
     }
+    if version <= 14 {
+        conn.execute_batch(
+            "ALTER TABLE messages ADD COLUMN provider_message_ref TEXT;
+             CREATE INDEX IF NOT EXISTS idx_messages_provider_ref
+                 ON messages(provider_message_ref);
+             PRAGMA user_version = 15;",
+        )?;
+    }
     conn.execute_batch("COMMIT;")?;
     Ok(())
 }
@@ -1067,6 +1100,8 @@ mod tests {
         let history = History::open(path.to_str().unwrap()).unwrap();
         history.execute_batch_for_test(
             "ALTER TABLE messages DROP COLUMN delivery_chunk_index;
+             DROP INDEX IF EXISTS idx_messages_provider_ref;
+             ALTER TABLE messages DROP COLUMN provider_message_ref;
              DROP TABLE legacy_state_migrations;
              DROP TABLE backend_sessions;
              DROP TABLE channel_cursors;
@@ -1111,6 +1146,8 @@ mod tests {
             "DROP TABLE legacy_state_migrations;
              DROP TABLE backend_sessions;
              DROP TABLE channel_cursors;
+             DROP INDEX IF EXISTS idx_messages_provider_ref;
+             ALTER TABLE messages DROP COLUMN provider_message_ref;
              PRAGMA user_version = 9;",
         );
         drop(history);
@@ -1143,6 +1180,8 @@ mod tests {
              DROP TABLE job_schedule_reviews;
              DROP TABLE job_schedule_legacy_baseline;
              DROP TABLE job_schedule_meta;
+             DROP INDEX IF EXISTS idx_messages_provider_ref;
+             ALTER TABLE messages DROP COLUMN provider_message_ref;
              PRAGMA user_version = 11;",
         );
         drop(history);
@@ -1172,7 +1211,7 @@ mod tests {
         let path = temp_path("outbound-delivery-progress");
         let mut history = History::open(path.to_str().unwrap()).unwrap();
         let inbound = history
-            .record_inbound("telegram", "telegram:dm:7", "telegram:1", "hello")
+            .record_inbound("telegram", "telegram:dm:7", "telegram:1", "hello", None)
             .unwrap();
         let outbound = history
             .record_outbound(inbound, OutboundOrigin::Backend, Some("codex"), "reply")
@@ -1198,7 +1237,7 @@ mod tests {
         let path = temp_path("approval-v1-migration");
         let mut history = History::open(path.to_str().unwrap()).unwrap();
         let inbound = history
-            .record_inbound("imessage", "imessage:self:me", "imessage:1", "hello")
+            .record_inbound("imessage", "imessage:self:me", "imessage:1", "hello", None)
             .unwrap();
         history.execute_batch_for_test(
             "DROP TABLE gateway_control_actions;
@@ -1206,6 +1245,8 @@ mod tests {
              DROP TABLE job_runs;
              DROP TABLE approval_questions;
              ALTER TABLE messages DROP COLUMN delivery_chunk_index;
+             DROP INDEX IF EXISTS idx_messages_provider_ref;
+             ALTER TABLE messages DROP COLUMN provider_message_ref;
              DROP TABLE legacy_state_migrations;
              DROP TABLE backend_sessions;
              DROP TABLE channel_cursors;
@@ -1238,6 +1279,8 @@ mod tests {
              DROP TABLE job_draft_proposals;
              DROP TABLE job_runs;
              ALTER TABLE messages DROP COLUMN delivery_chunk_index;
+             DROP INDEX IF EXISTS idx_messages_provider_ref;
+             ALTER TABLE messages DROP COLUMN provider_message_ref;
              DROP TABLE legacy_state_migrations;
              DROP TABLE backend_sessions;
              DROP TABLE channel_cursors;
@@ -1300,6 +1343,8 @@ mod tests {
              ALTER TABLE job_runs DROP COLUMN evaluation_state;
              DROP TABLE gateway_control_actions;
              ALTER TABLE messages DROP COLUMN delivery_chunk_index;
+             DROP INDEX IF EXISTS idx_messages_provider_ref;
+             ALTER TABLE messages DROP COLUMN provider_message_ref;
              DROP TABLE legacy_state_migrations;
              DROP TABLE backend_sessions;
              DROP TABLE channel_cursors;
@@ -1443,10 +1488,10 @@ mod tests {
         let mut history = History::open(path.to_str().unwrap()).unwrap();
 
         let first = history
-            .record_inbound("telegram", "telegram:dm:7", "telegram:101", "hello")
+            .record_inbound("telegram", "telegram:dm:7", "telegram:101", "hello", None)
             .unwrap();
         let retry = history
-            .record_inbound("telegram", "telegram:dm:7", "telegram:101", "hello")
+            .record_inbound("telegram", "telegram:dm:7", "telegram:101", "hello", None)
             .unwrap();
 
         assert_eq!(first, retry);
@@ -1459,11 +1504,42 @@ mod tests {
     }
 
     #[test]
+    fn provider_message_ref_roundtrips_and_supports_edits() {
+        let path = temp_path("history-provider-ref");
+        let mut history = History::open(path.to_str().unwrap()).unwrap();
+        let inbound = history
+            .record_inbound(
+                "telegram",
+                "telegram:dm:7",
+                "telegram:1",
+                "frist draft",
+                Some("telegram:7:500"),
+            )
+            .unwrap();
+        assert_eq!(
+            history
+                .inbound_id_for_provider_ref("telegram:7:500")
+                .unwrap(),
+            Some(inbound)
+        );
+        assert_eq!(
+            history
+                .inbound_id_for_provider_ref("telegram:7:999")
+                .unwrap(),
+            None
+        );
+        history
+            .replace_inbound_content(inbound, "first draft")
+            .unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn generated_reply_is_unique_and_delivery_survives_restart() {
         let path = temp_path("history-crash-boundary");
         let mut history = History::open(path.to_str().unwrap()).unwrap();
         let inbound = history
-            .record_inbound("imessage", "imessage:self:me", "imessage:4", "hello")
+            .record_inbound("imessage", "imessage:self:me", "imessage:4", "hello", None)
             .unwrap();
 
         let first = history
@@ -1492,16 +1568,28 @@ mod tests {
         let path = temp_path("history-rehydration-isolation");
         let mut history = History::open(path.to_str().unwrap()).unwrap();
         let first = history
-            .record_inbound("telegram", "telegram:dm:7", "telegram:1", "first")
+            .record_inbound("telegram", "telegram:dm:7", "telegram:1", "first", None)
             .unwrap();
         history
-            .record_inbound("telegram", "telegram:dm:7:topic:9", "telegram:2", "topic")
+            .record_inbound(
+                "telegram",
+                "telegram:dm:7:topic:9",
+                "telegram:2",
+                "topic",
+                None,
+            )
             .unwrap();
         history
-            .record_inbound("imessage", "telegram:dm:7", "imessage:3", "other channel")
+            .record_inbound(
+                "imessage",
+                "telegram:dm:7",
+                "imessage:3",
+                "other channel",
+                None,
+            )
             .unwrap();
         let current = history
-            .record_inbound("telegram", "telegram:dm:7", "telegram:4", "current")
+            .record_inbound("telegram", "telegram:dm:7", "telegram:4", "current", None)
             .unwrap();
         // Gateway polling may persist several inbound messages before the
         // per-thread worker generates the earlier reply. Rehydration still
@@ -1536,7 +1624,7 @@ mod tests {
         let path = temp_path("history-rehydration-malformed");
         let mut history = History::open(path.to_str().unwrap()).unwrap();
         let prior = history
-            .record_inbound("imessage", "imessage:self:me", "imessage:1", "valid")
+            .record_inbound("imessage", "imessage:self:me", "imessage:1", "valid", None)
             .unwrap();
         history
             .conn
@@ -1546,7 +1634,13 @@ mod tests {
             )
             .unwrap();
         let current = history
-            .record_inbound("imessage", "imessage:self:me", "imessage:2", "current")
+            .record_inbound(
+                "imessage",
+                "imessage:self:me",
+                "imessage:2",
+                "current",
+                None,
+            )
             .unwrap();
 
         let messages = history
@@ -1567,10 +1661,17 @@ mod tests {
                 "imessage:self:me",
                 "imessage:1",
                 &"x".repeat(MAX_HISTORY_READ_BYTES * 100),
+                None,
             )
             .unwrap();
         let current = history
-            .record_inbound("imessage", "imessage:self:me", "imessage:2", "current")
+            .record_inbound(
+                "imessage",
+                "imessage:self:me",
+                "imessage:2",
+                "current",
+                None,
+            )
             .unwrap();
 
         let messages = history
@@ -1588,10 +1689,10 @@ mod tests {
         let mut history = History::open(path.to_str().unwrap()).unwrap();
 
         history
-            .record_inbound("imessage", "dm:7", "imessage:1", "one")
+            .record_inbound("imessage", "dm:7", "imessage:1", "one", None)
             .unwrap();
         history
-            .record_inbound("telegram", "dm:7", "telegram:1", "two")
+            .record_inbound("telegram", "dm:7", "telegram:1", "two", None)
             .unwrap();
 
         let count: i64 = history
@@ -1607,10 +1708,10 @@ mod tests {
         let path = temp_path("history-origins");
         let mut history = History::open(path.to_str().unwrap()).unwrap();
         let backend_inbound = history
-            .record_inbound("telegram", "telegram:dm:7", "telegram:1", "one")
+            .record_inbound("telegram", "telegram:dm:7", "telegram:1", "one", None)
             .unwrap();
         let gateway_inbound = history
-            .record_inbound("telegram", "telegram:dm:7", "telegram:2", "/help")
+            .record_inbound("telegram", "telegram:dm:7", "telegram:2", "/help", None)
             .unwrap();
 
         history

@@ -61,6 +61,10 @@ pub struct RawMessage {
     /// Flattened excerpt of the message the user replied to (Telegram
     /// `reply_to_message`), prefixed to the backend prompt. None elsewhere.
     pub reply_context: Option<String>,
+    /// Provider message id of the original message when this update edits a
+    /// previously delivered inbound message (Telegram `edited_message`). The
+    /// gateway rewrites pending copies; edits never start new turns.
+    pub edit_of_message_id: Option<i64>,
 }
 
 impl RawMessage {
@@ -441,6 +445,7 @@ impl ChannelContract for IMessageChannel {
                 is_supported: true,
                 reply_to_message_id: None,
                 reply_context: None,
+                edit_of_message_id: None,
                 thread_id: None,
             })
             .collect())
@@ -922,6 +927,7 @@ mod tests {
             is_supported: true,
             reply_to_message_id: None,
             reply_context: None,
+            edit_of_message_id: None,
             thread_id: None,
         }
     }
@@ -941,6 +947,7 @@ mod tests {
             is_supported: true,
             reply_to_message_id: None,
             reply_context: None,
+            edit_of_message_id: None,
             thread_id: None,
         }
     }
@@ -1042,6 +1049,7 @@ mod tests {
             is_supported: true,
             reply_to_message_id: None,
             reply_context: None,
+            edit_of_message_id: None,
             thread_id: None,
         };
 

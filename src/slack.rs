@@ -665,6 +665,7 @@ impl Inbox {
                     is_supported: row.get(9)?,
                     reply_to_message_id: None,
                     reply_context: None,
+                    edit_of_message_id: None,
                     thread_id: None,
                 })
             })?

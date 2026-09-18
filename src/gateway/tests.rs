@@ -168,6 +168,7 @@ fn msg(chat: &str, handle: &str, from_me: bool, text: &str) -> RawMessage {
         is_supported: true,
         reply_to_message_id: None,
         reply_context: None,
+        edit_of_message_id: None,
         thread_id: None,
     }
 }
@@ -205,7 +206,7 @@ fn setup_failure_ctx(
     let history_path = temp_path("setup-failure-history");
     let mut history = History::open(history_path.to_str().unwrap()).unwrap();
     let inbound_id = history
-        .record_inbound("imessage", "imessage:self:me", "imessage:10", "hello")
+        .record_inbound("imessage", "imessage:self:me", "imessage:10", "hello", None)
         .unwrap();
     assert_eq!(inbound_id, 1);
     Ctx {
@@ -1288,6 +1289,7 @@ async fn pending_outbound_is_delivered_after_restart_without_backend_rerun() {
             "imessage:self:me@icloud.com",
             "imessage:1",
             "hello",
+            None,
         )
         .unwrap();
     history
@@ -1366,6 +1368,7 @@ async fn recovered_outbound_still_presents_authored_schedule_review() {
             "imessage:dm:+15551234567",
             "imessage:1",
             "create a schedule",
+            None,
         )
         .unwrap();
     history
@@ -1445,6 +1448,7 @@ async fn session_state_save_failure_keeps_reply_for_restart_without_backend_reru
             "imessage:self:me@icloud.com",
             "imessage:1",
             "hello",
+            None,
         )
         .unwrap();
     assert_eq!(
@@ -1530,6 +1534,7 @@ async fn exhausted_delivery_batch_retries_without_blocking_cursor() {
             "imessage:self:me@icloud.com",
             "imessage:1",
             "hello",
+            None,
         )
         .unwrap();
     assert_eq!(
@@ -3088,7 +3093,7 @@ async fn closed_worker_queue_is_recovered_without_another_message() {
         .history
         .lock()
         .unwrap()
-        .record_inbound("imessage", thread, "imessage:1", "recover older")
+        .record_inbound("imessage", thread, "imessage:1", "recover older", None)
         .unwrap();
     gateway.ack.lock().unwrap().in_flight.insert(1);
     let lost_job = Job {
@@ -3431,7 +3436,13 @@ async fn stop_targets_the_current_row_ahead_of_retained_failures() {
                 .history
                 .lock()
                 .unwrap()
-                .record_inbound("imessage", thread, &format!("imessage:{}", index + 1), text)
+                .record_inbound(
+                    "imessage",
+                    thread,
+                    &format!("imessage:{}", index + 1),
+                    text,
+                    None,
+                )
                 .unwrap()
         })
         .collect::<Vec<_>>();
@@ -3950,6 +3961,8 @@ fn missing_primary_closes_upgrade_migration_before_later_schedule_creation() {
          DROP TABLE job_schedule_reviews;
          DROP TABLE job_schedule_legacy_baseline;
          DROP TABLE job_schedule_meta;
+         DROP INDEX IF EXISTS idx_messages_provider_ref;
+         ALTER TABLE messages DROP COLUMN provider_message_ref;
          PRAGMA user_version = 11;",
     );
     drop(history);
@@ -4697,6 +4710,7 @@ fn message(row_id: i64, chat: &str, handle: &str, is_from_me: bool, text: &str) 
         is_supported: true,
         reply_to_message_id: None,
         reply_context: None,
+        edit_of_message_id: None,
         thread_id: None,
     }
 }
@@ -4722,8 +4736,22 @@ fn telegram_message(
         is_supported: true,
         reply_to_message_id: None,
         reply_context: None,
+        edit_of_message_id: None,
         thread_id: None,
     }
+}
+
+fn telegram_edit(
+    row_id: i64,
+    user_id: i64,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+) -> RawMessage {
+    let mut edit = telegram_message(row_id, user_id, chat_id, false, text);
+    edit.reply_to_message_id = Some(message_id);
+    edit.edit_of_message_id = Some(message_id);
+    edit
 }
 
 fn telegram_voice_message(row_id: i64, user_id: i64, chat_id: i64) -> RawMessage {
@@ -4778,6 +4806,7 @@ fn slack_image_message(
         is_supported: true,
         reply_to_message_id: None,
         reply_context: None,
+        edit_of_message_id: None,
         thread_id: None,
     }
 }
@@ -4971,7 +5000,13 @@ async fn messages_joining_phase_two_merge_without_extending_the_window() {
 
     run_messages(
         &mut gateway,
-        vec![message(1, "+15551234567", "+15551234567", false, "part one")],
+        vec![message(
+            1,
+            "+15551234567",
+            "+15551234567",
+            false,
+            "part one",
+        )],
     )
     .await;
     // t=1: phase 1 closes with one message; deadline fixed at t=2.
@@ -4983,7 +5018,13 @@ async fn messages_joining_phase_two_merge_without_extending_the_window() {
     tokio::time::advance(Duration::from_millis(500)).await;
     run_messages(
         &mut gateway,
-        vec![message(2, "+15551234567", "+15551234567", false, "part two")],
+        vec![message(
+            2,
+            "+15551234567",
+            "+15551234567",
+            false,
+            "part two",
+        )],
     )
     .await;
     assert_eq!(calls.lock().unwrap().len(), 0, "late message still held");
@@ -5016,7 +5057,13 @@ async fn stop_bypasses_debounce_and_flushes_the_held_batch() {
 
     run_messages(
         &mut gateway,
-        vec![message(1, "+15551234567", "+15551234567", false, "held work")],
+        vec![message(
+            1,
+            "+15551234567",
+            "+15551234567",
+            false,
+            "held work",
+        )],
     )
     .await;
     assert!(gateway.ack.lock().unwrap().debouncing.contains(&1));
@@ -5058,4 +5105,126 @@ async fn debounce_disabled_by_default_routes_each_message_immediately() {
     )
     .await;
     assert_eq!(calls.lock().unwrap().len(), 2);
+}
+
+/// Telegram gateway with a one-second debounce window, mirroring the staging
+/// trial configuration.
+async fn edit_sync_gateway(
+    state_tag: &str,
+    debounce_wait_secs: u64,
+) -> (Gateway, Arc<Mutex<Vec<FakeRunCall>>>) {
+    let state_path = temp_state_path();
+    let sessions_dir = temp_path(&format!("{state_tag}-sessions"));
+    let assistant_dir = temp_path(&format!("{state_tag}-assistant"));
+    std::fs::create_dir_all(&assistant_dir).unwrap();
+    let calls = Arc::new(Mutex::new(Vec::<FakeRunCall>::new()));
+    let mut cfg = test_config(
+        &state_path,
+        sessions_dir.to_str().unwrap(),
+        assistant_dir.to_str().unwrap(),
+    );
+    cfg.channel = "telegram".to_string();
+    cfg.self_handles.clear();
+    cfg.allow_from.clear();
+    cfg.telegram_bot_token = Some("secret".to_string());
+    cfg.telegram_allow_user_ids = vec![7];
+    cfg.debounce_wait_secs = debounce_wait_secs;
+    let mut gateway = Gateway::new(cfg).unwrap();
+    gateway.ctx.runners = Arc::new(fake_runners(calls.clone()));
+    (gateway, calls)
+}
+
+#[tokio::test(start_paused = true)]
+async fn edit_while_debouncing_rewrites_the_held_text() {
+    let (mut gateway, calls) = edit_sync_gateway("edit-held", 1).await;
+
+    let mut original = telegram_message(1, 7, 7, false, "orginal typo");
+    original.reply_to_message_id = Some(500);
+    run_messages(&mut gateway, vec![original]).await;
+    assert!(gateway.ack.lock().unwrap().debouncing.contains(&1));
+    assert_eq!(calls.lock().unwrap().len(), 0, "original is held");
+
+    // The edit lands inside the open window: it rewrites the held row in
+    // place without resetting or extending the window.
+    run_messages(
+        &mut gateway,
+        vec![telegram_edit(2, 7, 7, 500, "original fixed")],
+    )
+    .await;
+    assert_eq!(calls.lock().unwrap().len(), 0, "still held after edit");
+
+    // t=2: single-message window (1s phase 1 + 1s phase 2) closes.
+    tokio::time::advance(Duration::from_secs(2)).await;
+    run_messages(&mut gateway, vec![]).await;
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "one run for the corrected message");
+    assert!(calls[0].prompt.contains("original fixed"));
+    assert!(!calls[0].prompt.contains("orginal typo"));
+    drop(calls);
+    assert_eq!(gateway.store.lock().unwrap().cursor("telegram").unwrap(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn edit_after_the_row_was_processed_keeps_the_original_text() {
+    let (mut gateway, calls) = edit_sync_gateway("edit-late", 0).await;
+
+    let mut original = telegram_message(1, 7, 7, false, "frist draft");
+    original.reply_to_message_id = Some(500);
+    run_messages(&mut gateway, vec![original]).await;
+    assert_eq!(calls.lock().unwrap().len(), 1);
+
+    // The row is already claimed and processed: the edit is dropped, never
+    // a second run, and the processed text stands.
+    run_messages(
+        &mut gateway,
+        vec![telegram_edit(2, 7, 7, 500, "first draft")],
+    )
+    .await;
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "edit never starts a run");
+    assert!(calls[0].prompt.contains("frist draft"));
+    assert!(!calls[0].prompt.contains("first draft"));
+    drop(calls);
+    assert_eq!(gateway.store.lock().unwrap().cursor("telegram").unwrap(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn edit_during_phase_two_joins_the_merged_batch() {
+    let (mut gateway, calls) = edit_sync_gateway("edit-phase2", 1).await;
+
+    let mut first = telegram_message(1, 7, 7, false, "preamble typo");
+    first.reply_to_message_id = Some(500);
+    let mut second = telegram_message(2, 7, 7, false, "second part");
+    second.reply_to_message_id = Some(501);
+    run_messages(&mut gateway, vec![first, second]).await;
+    assert_eq!(calls.lock().unwrap().len(), 0, "burst held");
+
+    // t=1: phase 1 closes with n=2, fixing the deadline at t=3.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    run_messages(&mut gateway, vec![]).await;
+    assert_eq!(calls.lock().unwrap().len(), 0);
+
+    // t=1.5: the edit rewrites the first held message mid-phase-2. The
+    // window must not extend, and the edit must not start its own run.
+    tokio::time::advance(Duration::from_millis(500)).await;
+    run_messages(
+        &mut gateway,
+        vec![telegram_edit(3, 7, 7, 500, "preamble fixed")],
+    )
+    .await;
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        0,
+        "edit does not flush the batch"
+    );
+
+    // t=3: the original deadline fires; the merged batch carries the
+    // corrected first message plus the untouched second one.
+    tokio::time::advance(Duration::from_millis(1500)).await;
+    run_messages(&mut gateway, vec![]).await;
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].prompt.contains("preamble fixed"));
+    assert!(calls[0].prompt.contains("second part"));
+    assert!(!calls[0].prompt.contains("preamble typo"));
 }

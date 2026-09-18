@@ -763,9 +763,9 @@ mod tests {
                 .join("Code/assistant/jobs")
                 .to_string_lossy()
         );
-        let push_root = std::env::var("PUSH_HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| {
-            Path::new(&std::env::var("HOME").unwrap()).join(".push")
-        });
+        let push_root = std::env::var("PUSH_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| Path::new(&std::env::var("HOME").unwrap()).join(".push"));
         assert_eq!(cfg.paths.database, push_root.join("push.db"));
         assert_eq!(
             cfg.assistant_root,

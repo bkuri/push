@@ -519,6 +519,8 @@ struct Update {
     update_id: i64,
     #[serde(default)]
     message: Option<TelegramMessage>,
+    #[serde(default)]
+    edited_message: Option<TelegramMessage>,
 }
 
 /// Builds `reply_parameters` for anchored sends. The quote (a portion of the
@@ -540,7 +542,19 @@ fn reply_parameters_payload(
 
 impl Update {
     fn into_raw(self) -> RawMessage {
-        let Some(message) = self.message else {
+        // An `edited_message` update corrects an earlier inbound message; it
+        // must never start a turn of its own. `message_id` is unchanged by
+        // the edit, so it identifies the row to rewrite. A malformed edit
+        // without a message id degrades to an unsupported update.
+        let is_edit = self.message.is_none() && self.edited_message.is_some();
+        let edit_of_message_id = if is_edit {
+            self.edited_message
+                .as_ref()
+                .and_then(|edited| edited.message_id)
+        } else {
+            None
+        };
+        let Some(message) = self.message.or(self.edited_message) else {
             return RawMessage {
                 row_id: self.update_id,
                 provider_event_id: None,
@@ -556,6 +570,7 @@ impl Update {
                 thread_id: None,
                 reply_to_message_id: None,
                 reply_context: None,
+                edit_of_message_id: None,
             };
         };
         let images = message
@@ -589,7 +604,7 @@ impl Update {
             })
             .into_iter()
             .collect();
-        RawMessage {
+        let mut raw = RawMessage {
             row_id: self.update_id,
             provider_event_id: None,
             channel: "telegram",
@@ -623,7 +638,12 @@ impl Update {
                         .map(str::to_string)
                 })
                 .map(|text| reply_excerpt(&text)),
+            edit_of_message_id,
+        };
+        if is_edit && raw.edit_of_message_id.is_none() {
+            raw.is_supported = false;
         }
+        raw
     }
 }
 
@@ -859,7 +879,7 @@ mod tests {
                         "text": "group"
                     }
                 },
-                {"update_id": 103, "edited_message": {}},
+                {"update_id": 103, "callback_query": {}},
                 {
                     "update_id": 104,
                     "message": {
@@ -996,6 +1016,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parses_edited_message_as_edit_of_the_original() {
+        let fake = Arc::new(FakeTransport::with_responses(vec![json!({
+            "ok": true,
+            "result": [
+                {
+                    "update_id": 201,
+                    "edited_message": {
+                        "from": {"id": 7},
+                        "chat": {"id": 7, "type": "private"},
+                        "message_id": 500,
+                        "text": "corrected text"
+                    }
+                },
+                {
+                    "update_id": 202,
+                    "edited_message": {
+                        "from": {"id": 7},
+                        "chat": {"id": 7, "type": "private"},
+                        "text": "missing message id"
+                    }
+                }
+            ]
+        })]));
+        let telegram = Telegram::with_transport("secret".to_string(), vec![7], vec![], fake);
+
+        let messages = telegram.poll(200).await.unwrap();
+
+        assert_eq!(messages.len(), 2);
+        // A well-formed edit carries the provider message id of the edited
+        // original (unchanged by the edit) and stays a supported update so
+        // the gateway can route it through the allowlist.
+        assert_eq!(messages[0].row_id, 201);
+        assert_eq!(messages[0].edit_of_message_id, Some(500));
+        assert_eq!(messages[0].reply_to_message_id, Some(500));
+        assert_eq!(messages[0].text, "corrected text");
+        assert!(messages[0].is_supported);
+        // Without a message id the edit cannot be matched to its row: it
+        // degrades to unsupported instead of becoming a new inbound message.
+        assert_eq!(messages[1].edit_of_message_id, None);
+        assert!(!messages[1].is_supported);
+    }
+
+    #[tokio::test]
     async fn poll_uses_next_update_offset_and_long_poll_timeout() {
         let fake = Arc::new(FakeTransport::with_responses(vec![json!({
             "ok": true,
@@ -1031,6 +1094,7 @@ mod tests {
         let telegram = Telegram::new("secret".to_string(), vec![7], vec![9]);
         let mut message = Update {
             update_id: 1,
+            edited_message: None,
             message: Some(TelegramMessage {
                 from: Some(User { id: 7 }),
                 chat: Chat {
@@ -1061,6 +1125,7 @@ mod tests {
     fn parses_voice_attachment_without_downloading_it() {
         let message = Update {
             update_id: 2,
+            edited_message: None,
             message: Some(TelegramMessage {
                 from: Some(User { id: 7 }),
                 chat: Chat {

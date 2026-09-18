@@ -14,7 +14,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::agent::Runner;
 use crate::approval::{AnswerOrigin, AnswerOutcome};
@@ -691,6 +691,17 @@ impl Gateway {
             if self.ack.lock().unwrap().is_known(m.row_id) {
                 continue;
             }
+            // An `edited_message` update rewrites the pending row it targets;
+            // it never becomes a new turn of its own.
+            if m.edit_of_message_id.is_some() {
+                if let Some((thread, target)) = self.channel.accept(m) {
+                    self.apply_edit(m, &thread, &target).await;
+                } else {
+                    self.audit(self.ctx.audit.ignored(m, self.channel.reject_reason(m)));
+                    self.complete_row(m.row_id, "ignored");
+                }
+                continue;
+            }
             if let Some((thread, target)) = self.channel.accept(m) {
                 let deferred = {
                     let mut store = self.store.lock().unwrap();
@@ -867,11 +878,15 @@ impl Gateway {
                         return;
                     }
                 }
+                let provider_message_ref = m
+                    .reply_to_message_id
+                    .map(|id| format!("{}:{}:{}", m.channel, m.chat_identifier, id));
                 let inbound_id = match self.ctx.history.lock().unwrap().record_inbound(
                     m.channel,
                     &thread,
                     &m.event_id(),
                     message_text.trim(),
+                    provider_message_ref.as_deref(),
                 ) {
                     Ok(id) => id,
                     Err(error) => {
@@ -1206,6 +1221,74 @@ impl Gateway {
         if !self.route(merged).await {
             warn!("[{thread}] merged debounce batch routing failed; row will retry");
         }
+    }
+
+    /// Applies an inbound edit: rewrites the corrected text into every copy of
+    /// the message that has not been claimed by a worker yet — the canonical
+    /// history row, held debounce batches, and jobs queued behind a busy
+    /// worker. Edits arriving after the row was claimed, or for unknown rows,
+    /// are dropped: the agent must see one stable text per turn. Rewrites never
+    /// reset or extend an open debounce window.
+    async fn apply_edit(&mut self, m: &RawMessage, thread: &str, target: &str) {
+        let message_id = m.edit_of_message_id.unwrap_or_default();
+        let corrected = m.text.trim().to_string();
+        let mut matched: Option<i64> = None;
+        if let Some(batch) = self.debouncing.get_mut(thread) {
+            for job in &mut batch.jobs {
+                if job.telegram_reply_anchor == Some(message_id) && job.target == target {
+                    job.text = corrected.clone();
+                    matched = Some(job.inbound_id);
+                }
+            }
+        }
+        if let Some(queue) = self.queues.get(thread) {
+            let worker = &mut *queue.state.lock().unwrap();
+            for job in worker.pending.iter_mut() {
+                if job.telegram_reply_anchor == Some(message_id)
+                    && job.target == target
+                    && worker.current_row != Some(job.row_id)
+                {
+                    job.text = corrected.clone();
+                    matched = Some(job.inbound_id);
+                }
+            }
+        }
+        let Some(inbound_id) = matched else {
+            // No pending copy left: either the row was already claimed or
+            // processed (too late), or it never existed (unknown).
+            let provider_ref = format!("{}:{}:{}", m.channel, m.chat_identifier, message_id);
+            match self
+                .ctx
+                .history
+                .lock()
+                .unwrap()
+                .inbound_id_for_provider_ref(&provider_ref)
+            {
+                Ok(Some(_)) => warn!(
+                    "[{thread}] edit for message {message_id} arrived after the row was claimed; original text stands"
+                ),
+                Ok(None) => {
+                    debug!("[{thread}] edit for unknown message {message_id} dropped")
+                }
+                Err(error) => {
+                    warn!("[{thread}] edit lookup for message {message_id} failed: {error:#}")
+                }
+            }
+            self.complete_row(m.row_id, "edit_dropped");
+            return;
+        };
+        if let Err(error) = self
+            .ctx
+            .history
+            .lock()
+            .unwrap()
+            .replace_inbound_content(inbound_id, &corrected)
+        {
+            warn!("[{thread}] edit rewrite for message {message_id} failed: {error:#}");
+        } else {
+            info!("[{thread}] edit applied to pending message {message_id}");
+        }
+        self.complete_row(m.row_id, "edit_applied");
     }
 
     async fn stop(&mut self, job: Job) -> bool {
