@@ -68,7 +68,7 @@ where
         report_delivery(
             ctx,
             &job,
-            deliver_stored(ctx, &job, &outbound).await,
+            deliver_stored(ctx, &job, &outbound, None).await,
             &outbound.content,
             "recovered_outbound",
             "recover outbound",
@@ -443,7 +443,7 @@ where
                 );
                 return;
             }
-            let delivery = deliver_stored(ctx, &job, &outbound).await;
+            let delivery = deliver_stored(ctx, &job, &outbound, None).await;
             if delivery.is_ok() {
                 info!("[{}] reply sent via {}", job.thread, ctx.channel.id());
             }
@@ -718,7 +718,7 @@ async fn finish_run_with_gateway_reply(ctx: &Ctx, job: &Job, reply: &str, labels
     report_delivery(
         ctx,
         job,
-        deliver_stored(ctx, job, &outbound).await,
+        deliver_stored(ctx, job, &outbound, None).await,
         reply,
         labels.completion,
         labels.deliver,
@@ -853,13 +853,14 @@ pub(super) async fn record_and_deliver(
     origin: OutboundOrigin,
     text: &str,
 ) -> Result<DeliveryOutcome> {
+    let (quote, text) = super::lift_outbound_quote(text);
     let outbound = ctx.history.lock().unwrap().record_outbound(
         job.inbound_id,
         origin,
         Some(job.backend.as_str()),
-        text,
+        &text,
     )?;
-    deliver_stored(ctx, job, &outbound).await
+    deliver_stored(ctx, job, &outbound, quote.as_deref()).await
 }
 
 /// Records an outbound reply and tries delivery once. Control-path replies use
@@ -879,8 +880,14 @@ pub(super) async fn record_and_deliver_once(
     if outbound.status == DeliveryStatus::Delivered {
         return Ok(true);
     }
-    let delivered =
-        deliver_outbound_once(ctx, &job.target, job.telegram_reply_anchor, &mut outbound).await?;
+    let delivered = deliver_outbound_once(
+        ctx,
+        &job.target,
+        job.telegram_reply_anchor,
+        None,
+        &mut outbound,
+    )
+    .await?;
     ctx.history.lock().unwrap().mark_delivery(
         outbound.id,
         if delivered {
@@ -896,6 +903,7 @@ async fn deliver_stored(
     ctx: &Ctx,
     job: &Job,
     outbound: &OutboundMessage,
+    quote: Option<&str>,
 ) -> Result<DeliveryOutcome> {
     if outbound.status == DeliveryStatus::Delivered {
         return Ok(DeliveryOutcome::AlreadyDelivered);
@@ -905,9 +913,14 @@ async fn deliver_stored(
     let mut attempt = 0;
     loop {
         attempt += 1;
-        let delivered =
-            deliver_outbound_once(ctx, &job.target, job.telegram_reply_anchor, &mut outbound)
-                .await?;
+        let delivered = deliver_outbound_once(
+            ctx,
+            &job.target,
+            job.telegram_reply_anchor,
+            quote,
+            &mut outbound,
+        )
+        .await?;
         let status = if delivered {
             DeliveryStatus::Delivered
         } else {
@@ -953,6 +966,7 @@ async fn deliver_outbound_once(
     ctx: &Ctx,
     target: &str,
     reply_anchor: Option<i64>,
+    quote: Option<&str>,
     outbound: &mut OutboundMessage,
 ) -> Result<bool> {
     let chunks = ctx
@@ -971,7 +985,7 @@ async fn deliver_outbound_once(
         .enumerate()
         .skip(outbound.delivery_chunk_index)
     {
-        if let Err(error) = super::send_reply_chunk(ctx, target, reply_anchor, chunk).await {
+        if let Err(error) = super::send_reply_chunk(ctx, target, reply_anchor, quote, chunk).await {
             error!(
                 "outbound {} chunk {index} send error to {target}: {error}",
                 outbound.id

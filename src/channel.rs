@@ -78,6 +78,9 @@ pub struct OutboundChunk {
     pub rich_markdown: bool,
     /// Telegram message id to reply to (anchoring), when known.
     pub reply_to_message_id: Option<i64>,
+    /// Exact portion of the trigger message to quote in the reply header
+    /// (Telegram `reply_parameters.quote`), chosen by the backend.
+    pub quote: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -526,6 +529,7 @@ impl ChannelContract for IMessageChannel {
         } else {
             vec![OutboundChunk {
                 reply_to_message_id: None,
+                quote: None,
                 text: format!("{text}{marker}"),
                 rich_markdown: false,
             }]
@@ -642,6 +646,7 @@ impl ChannelContract for Telegram {
             .into_iter()
             .map(|text| OutboundChunk {
                 reply_to_message_id: None,
+                quote: None,
                 text,
                 rich_markdown: true,
             })
@@ -650,11 +655,21 @@ impl ChannelContract for Telegram {
 
     async fn send_chunk(&self, target: &str, chunk: &OutboundChunk) -> Result<()> {
         if chunk.rich_markdown {
-            self.send_rich_reply(target, &chunk.text, chunk.reply_to_message_id)
-                .await
+            self.send_rich_reply(
+                target,
+                &chunk.text,
+                chunk.reply_to_message_id,
+                chunk.quote.as_deref(),
+            )
+            .await
         } else {
-            self.send_plain_reply(target, &chunk.text, chunk.reply_to_message_id)
-                .await
+            self.send_plain_reply(
+                target,
+                &chunk.text,
+                chunk.reply_to_message_id,
+                chunk.quote.as_deref(),
+            )
+            .await
         }
     }
 
@@ -751,6 +766,7 @@ impl ChannelContract for Slack {
             .into_iter()
             .map(|text| OutboundChunk {
                 reply_to_message_id: None,
+                quote: None,
                 text,
                 rich_markdown: true,
             })
@@ -959,6 +975,7 @@ mod tests {
             channel.outbound_chunks("reply", REPLY_MARKER),
             [OutboundChunk {
                 reply_to_message_id: None,
+                quote: None,
                 text: format!("reply{REPLY_MARKER}"),
                 rich_markdown: false,
             }]
@@ -995,6 +1012,7 @@ mod tests {
             channel.outbound_chunks("reply", REPLY_MARKER),
             [OutboundChunk {
                 reply_to_message_id: None,
+                quote: None,
                 text: "reply".to_string(),
                 rich_markdown: true,
             }]

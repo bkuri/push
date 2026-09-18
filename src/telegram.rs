@@ -263,7 +263,7 @@ impl Telegram {
     }
 
     pub async fn send_rich(&self, target: &str, text: &str) -> Result<()> {
-        self.send_rich_reply(target, text, None).await
+        self.send_rich_reply(target, text, None, None).await
     }
 
     pub async fn send_rich_reply(
@@ -271,6 +271,7 @@ impl Telegram {
         target: &str,
         text: &str,
         reply_to_message_id: Option<i64>,
+        quote: Option<&str>,
     ) -> Result<()> {
         if text.encode_utf16().count() > TEXT_LIMIT {
             bail!("Telegram rich message exceeds the {TEXT_LIMIT} character chunk limit");
@@ -279,9 +280,8 @@ impl Telegram {
         let mut payload = target_payload(target);
         payload["text"] = json!(html);
         payload["parse_mode"] = json!("HTML");
-        if let Some(id) = reply_to_message_id {
-            payload["reply_parameters"] =
-                json!({"message_id": id, "allow_sending_without_reply": true});
+        if let Some(params) = reply_parameters_payload(reply_to_message_id, quote) {
+            payload["reply_parameters"] = params;
         }
         let transport_response = self
             .post_with_topic_fallback("sendMessage", payload)
@@ -298,7 +298,7 @@ impl Telegram {
     }
 
     pub async fn send_plain(&self, target: &str, text: &str) -> Result<()> {
-        self.send_plain_reply(target, text, None).await
+        self.send_plain_reply(target, text, None, None).await
     }
 
     pub async fn send_plain_reply(
@@ -306,12 +306,12 @@ impl Telegram {
         target: &str,
         text: &str,
         reply_to_message_id: Option<i64>,
+        quote: Option<&str>,
     ) -> Result<()> {
         let mut payload = target_payload(target);
         payload["text"] = json!(text);
-        if let Some(id) = reply_to_message_id {
-            payload["reply_parameters"] =
-                json!({"message_id": id, "allow_sending_without_reply": true});
+        if let Some(params) = reply_parameters_payload(reply_to_message_id, quote) {
+            payload["reply_parameters"] = params;
         }
         let transport_response = self
             .post_with_topic_fallback("sendMessage", payload)
@@ -525,6 +525,23 @@ struct Update {
     update_id: i64,
     #[serde(default)]
     message: Option<TelegramMessage>,
+}
+
+/// Builds `reply_parameters` for anchored sends. The quote (a portion of the
+/// replied-to message chosen by the backend) only renders when anchored, and
+/// Telegram caps it at 1024 characters.
+fn reply_parameters_payload(
+    reply_to_message_id: Option<i64>,
+    quote: Option<&str>,
+) -> Option<Value> {
+    let mut params = json!({
+        "message_id": reply_to_message_id?,
+        "allow_sending_without_reply": true
+    });
+    if let Some(quoted) = quote {
+        params["quote"] = json!(quoted.chars().take(1024).collect::<String>());
+    }
+    Some(params)
 }
 
 impl Update {
@@ -948,7 +965,7 @@ mod tests {
 
         telegram.send_plain("chat", "hi").await.unwrap();
         telegram
-            .send_plain_reply("chat", "hi", Some(41))
+            .send_plain_reply("chat", "hi", Some(41), Some("the frobnicator"))
             .await
             .unwrap();
 
@@ -960,6 +977,25 @@ mod tests {
             calls[1].1["reply_parameters"]["allow_sending_without_reply"],
             true
         );
+        assert_eq!(calls[1].1["reply_parameters"]["quote"], "the frobnicator");
+    }
+
+    #[tokio::test]
+    async fn quote_is_dropped_without_an_anchor() {
+        let fake = Arc::new(FakeTransport::with_responses(vec![json!({
+            "ok": true,
+            "result": {"message_id": 5}
+        })]));
+        let telegram =
+            Telegram::with_transport("secret".to_string(), vec![7], vec![], fake.clone());
+
+        telegram
+            .send_plain_reply("chat", "hi", None, Some("orphan quote"))
+            .await
+            .unwrap();
+
+        let calls = fake.calls.lock().unwrap();
+        assert!(calls[0].1.get("reply_parameters").is_none());
     }
 
     #[tokio::test]

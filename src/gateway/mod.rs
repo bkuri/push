@@ -1237,6 +1237,30 @@ fn audit_schedule_events(ctx: &Ctx, ledger: &mut jobs::Ledger) {
     }
 }
 
+/// Lifts a leading `> quoted portion` line from a backend reply into the
+/// Telegram reply quote and strips it from the displayed text. A reply that
+/// is only a quote line is left untouched so it cannot become empty.
+fn lift_outbound_quote(text: &str) -> (Option<String>, String) {
+    let trimmed = text.trim_start();
+    let Some(first_line) = trimmed.lines().next() else {
+        return (None, text.to_string());
+    };
+    let Some(quoted) = first_line
+        .strip_prefix("> ")
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+    else {
+        return (None, text.to_string());
+    };
+    let rest = trimmed[first_line.len()..]
+        .trim_start_matches(['\r', '\n'])
+        .to_string();
+    if rest.is_empty() {
+        return (None, text.to_string());
+    }
+    (Some(quoted.to_string()), rest)
+}
+
 async fn reply_to(ctx: &Ctx, target: &str, text: &str, reply_anchor: Option<i64>) -> bool {
     let chunks = ctx.channel.outbound_chunks(text, &ctx.reply_marker);
     if chunks.is_empty() {
@@ -1244,7 +1268,7 @@ async fn reply_to(ctx: &Ctx, target: &str, text: &str, reply_anchor: Option<i64>
         return false;
     }
     for chunk in chunks {
-        if let Err(error) = send_reply_chunk(ctx, target, reply_anchor, &chunk).await {
+        if let Err(error) = send_reply_chunk(ctx, target, reply_anchor, None, &chunk).await {
             error!("send error to {target}: {error}");
             return false;
         }
@@ -1257,6 +1281,7 @@ async fn send_reply_chunk(
     ctx: &Ctx,
     target: &str,
     reply_anchor: Option<i64>,
+    quote: Option<&str>,
     chunk: &crate::channel::OutboundChunk,
 ) -> Result<()> {
     #[cfg(test)]
@@ -1294,6 +1319,7 @@ async fn send_reply_chunk(
     {
         let mut chunk = chunk.clone();
         chunk.reply_to_message_id = reply_anchor;
+        chunk.quote = quote.map(str::to_string);
         let timeout = ctx.channel.delivery_semantics().send_timeout;
         if timeout.is_zero() {
             ctx.channel.send_chunk(target, &chunk).await
@@ -1342,7 +1368,7 @@ async fn send_scheduled_chunk(
     target: &str,
     chunk: &crate::channel::OutboundChunk,
 ) -> Result<()> {
-    send_reply_chunk(ctx, target, None, chunk).await
+    send_reply_chunk(ctx, target, None, None, chunk).await
 }
 
 fn complete_row(store: &Arc<Mutex<Store>>, ack: &Arc<Mutex<AckState>>, channel: &str, row_id: i64) {

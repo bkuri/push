@@ -4187,3 +4187,23 @@ fn slack_image_message(
         thread_id: None,
     }
 }
+
+#[test]
+fn lifts_leading_quote_line_from_backend_replies() {
+    let (quote, rest) =
+        super::lift_outbound_quote("> the frobnicator keeps timing out\nTry the cache path.");
+    assert_eq!(quote.as_deref(), Some("the frobnicator keeps timing out"));
+    assert_eq!(rest, "Try the cache path.");
+
+    let (quote, rest) = super::lift_outbound_quote("No quote here.\n> not lifted");
+    assert!(quote.is_none());
+    assert_eq!(rest, "No quote here.\n> not lifted");
+
+    let (quote, rest) = super::lift_outbound_quote("> quote only");
+    assert!(quote.is_none());
+    assert_eq!(rest, "> quote only");
+
+    let (quote, rest) = super::lift_outbound_quote("> \nafter empty quote");
+    assert!(quote.is_none());
+    assert_eq!(rest, "> \nafter empty quote");
+}
