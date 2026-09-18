@@ -262,10 +262,6 @@ impl Telegram {
         self.allow_user_ids.contains(&chat_id) || self.allow_chat_ids.contains(&chat_id)
     }
 
-    pub async fn send_rich(&self, target: &str, text: &str) -> Result<()> {
-        self.send_rich_reply(target, text, None, None).await
-    }
-
     pub async fn send_rich_reply(
         &self,
         target: &str,
@@ -291,14 +287,12 @@ impl Telegram {
         if !response.ok {
             // Rendered HTML Telegram rejects (for example a parse error)
             // still reaches the user as plain text within the same durable
-            // delivery chunk.
-            self.send_plain(target, text).await?;
+            // delivery chunk. Keep the anchoring and quote across the
+            // fallback.
+            self.send_plain_reply(target, text, reply_to_message_id, quote)
+                .await?;
         }
         Ok(())
-    }
-
-    pub async fn send_plain(&self, target: &str, text: &str) -> Result<()> {
-        self.send_plain_reply(target, text, None, None).await
     }
 
     pub async fn send_plain_reply(
@@ -963,7 +957,10 @@ mod tests {
         let telegram =
             Telegram::with_transport("secret".to_string(), vec![7], vec![], fake.clone());
 
-        telegram.send_plain("chat", "hi").await.unwrap();
+        telegram
+            .send_plain_reply("chat", "hi", None, None)
+            .await
+            .unwrap();
         telegram
             .send_plain_reply("chat", "hi", Some(41), Some("the frobnicator"))
             .await
@@ -1272,7 +1269,10 @@ mod tests {
         let telegram =
             Telegram::with_transport("do-not-log".to_string(), vec![7], vec![], fake.clone());
 
-        telegram.send_rich("7", "**reply**").await.unwrap();
+        telegram
+            .send_rich_reply("7", "**reply**", None, None)
+            .await
+            .unwrap();
 
         let calls = fake.calls.lock().unwrap();
         assert_eq!(
@@ -1299,7 +1299,10 @@ mod tests {
             Telegram::with_transport("secret".to_string(), vec![7], vec![], fake.clone());
         let text = "**reply**";
 
-        telegram.send_rich("7", text).await.unwrap();
+        telegram
+            .send_rich_reply("7", text, None, None)
+            .await
+            .unwrap();
 
         let calls = fake.calls.lock().unwrap();
         // The HTML send and its plain fallback share one gateway-owned chunk.
@@ -1317,7 +1320,7 @@ mod tests {
             Telegram::with_transport("secret".to_string(), vec![7], vec![], fake.clone());
 
         let error = telegram
-            .send_rich("7", &"x".repeat(TEXT_LIMIT + 1))
+            .send_rich_reply("7", &"x".repeat(TEXT_LIMIT + 1), None, None)
             .await
             .unwrap_err();
 
@@ -1335,8 +1338,14 @@ mod tests {
         let telegram =
             Telegram::with_transport("secret".to_string(), vec![7], vec![], fake.clone());
 
-        telegram.send_plain("7:99", "reply").await.unwrap();
-        telegram.send_rich("7:99", "reply").await.unwrap();
+        telegram
+            .send_plain_reply("7:99", "reply", None, None)
+            .await
+            .unwrap();
+        telegram
+            .send_rich_reply("7:99", "reply", None, None)
+            .await
+            .unwrap();
         telegram.send_typing("7:99").await.unwrap();
 
         let calls = fake.calls.lock().unwrap();
@@ -1375,7 +1384,10 @@ mod tests {
         let telegram =
             Telegram::with_transport("secret".to_string(), vec![7], vec![], fake.clone());
 
-        telegram.send_plain("7:99", "reply").await.unwrap();
+        telegram
+            .send_plain_reply("7:99", "reply", None, None)
+            .await
+            .unwrap();
 
         let calls = fake.calls.lock().unwrap();
         assert_eq!(
@@ -1402,7 +1414,10 @@ mod tests {
         let telegram =
             Telegram::with_transport("secret".to_string(), vec![7], vec![], fake.clone());
 
-        let error = telegram.send_plain("7:99", "reply").await.unwrap_err();
+        let error = telegram
+            .send_plain_reply("7:99", "reply", None, None)
+            .await
+            .unwrap_err();
 
         assert!(error.to_string().contains("HTTP 400"));
         assert_eq!(fake.calls.lock().unwrap().len(), 1);
@@ -1414,7 +1429,10 @@ mod tests {
         let telegram =
             Telegram::with_transport("secret".to_string(), vec![7], vec![], fake.clone());
 
-        telegram.send_rich("7:99", "reply").await.unwrap();
+        telegram
+            .send_rich_reply("7:99", "reply", None, None)
+            .await
+            .unwrap();
 
         let calls = fake.calls.lock().unwrap();
         assert_eq!(calls[0].0, "sendMessage");
@@ -1471,7 +1489,10 @@ mod tests {
         let text = format!("{}é", "a".repeat(TEXT_LIMIT));
 
         for chunk in split_text(&text) {
-            telegram.send_plain("7", &chunk).await.unwrap();
+            telegram
+                .send_plain_reply("7", &chunk, None, None)
+                .await
+                .unwrap();
         }
 
         let calls = fake.calls.lock().unwrap();

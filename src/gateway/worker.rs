@@ -412,11 +412,12 @@ where
                 ctx.audit
                     .backend_completed(job.row_id, &job.thread, job.backend, &out.reply),
             );
+            let (reply_quote, reply_text) = super::lift_outbound_quote(&out.reply);
             let outbound = match ctx.history.lock().unwrap().record_outbound(
                 job.inbound_id,
                 OutboundOrigin::Backend,
                 Some(job.backend.as_str()),
-                &out.reply,
+                &reply_text,
             ) {
                 Ok(outbound) => outbound,
                 Err(error) => {
@@ -443,7 +444,7 @@ where
                 );
                 return;
             }
-            let delivery = deliver_stored(ctx, &job, &outbound, None).await;
+            let delivery = deliver_stored(ctx, &job, &outbound, reply_quote.as_deref()).await;
             if delivery.is_ok() {
                 info!("[{}] reply sent via {}", job.thread, ctx.channel.id());
             }
@@ -451,7 +452,7 @@ where
                 ctx,
                 &job,
                 delivery,
-                &out.reply,
+                &reply_text,
                 "completed",
                 "deliver backend reply",
             );

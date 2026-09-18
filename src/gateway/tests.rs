@@ -1077,6 +1077,7 @@ async fn missing_backend_session_rotates_and_rehydrates_once() {
             wait_for_release: None,
             failure: None,
             resume_missing_once: Some(missing),
+            reply: None,
         }),
     );
     gateway.ctx.runners = Arc::new(runners);
@@ -1161,6 +1162,7 @@ async fn backend_switch_and_clear_start_fresh_sessions_with_history() {
             wait_for_release: None,
             failure: None,
             resume_missing_once: None,
+            reply: None,
         }),
     );
     runners.insert(
@@ -1173,6 +1175,7 @@ async fn backend_switch_and_clear_start_fresh_sessions_with_history() {
             wait_for_release: None,
             failure: None,
             resume_missing_once: None,
+            reply: None,
         }),
     );
     gateway.ctx.runners = Arc::new(runners);
@@ -1887,6 +1890,7 @@ async fn slack_images_reach_every_agent_backend_and_are_removed_after_each_turn(
                 wait_for_release: None,
                 failure: None,
                 resume_missing_once: None,
+                reply: None,
             }),
         )]));
 
@@ -1946,6 +1950,7 @@ async fn imessage_images_reach_every_agent_backend_and_are_removed_after_each_tu
                 wait_for_release: None,
                 failure: None,
                 resume_missing_once: None,
+                reply: None,
             }),
         )]));
         let mut inbound = message(1, "+15551234567", "+15551234567", false, "");
@@ -2476,6 +2481,7 @@ async fn telegram_image_only_and_captioned_messages_reach_pi() {
             wait_for_release: None,
             failure: None,
             resume_missing_once: None,
+            reply: None,
         }),
     )]));
 
@@ -2636,6 +2642,7 @@ async fn telegram_image_reaches_claude_and_is_removed_after_the_turn() {
             wait_for_release: None,
             failure: None,
             resume_missing_once: None,
+            reply: None,
         }),
     )]));
     run_messages(
@@ -2876,6 +2883,7 @@ async fn stop_interrupts_active_run_and_preserves_queued_messages() {
             wait_for_release: Some(release.clone()),
             failure: None,
             resume_missing_once: None,
+            reply: None,
         }),
     );
     gateway.ctx.runners = Arc::new(runners);
@@ -2985,6 +2993,7 @@ async fn stop_interrupts_a_worker_queued_in_the_same_poll_batch() {
             wait_for_release: Some(release.clone()),
             failure: None,
             resume_missing_once: None,
+            reply: None,
         }),
     );
     gateway.ctx.runners = Arc::new(runners);
@@ -3253,6 +3262,7 @@ async fn retried_stop_acknowledgement_does_not_cancel_the_next_request() {
             wait_for_release: Some(release.clone()),
             failure: None,
             resume_missing_once: None,
+            reply: None,
         }),
     );
     gateway.ctx.runners = Arc::new(runners);
@@ -3318,6 +3328,7 @@ async fn retried_stop_acknowledgement_does_not_cancel_the_next_request() {
             wait_for_release: Some(restart_release.clone()),
             failure: None,
             resume_missing_once: None,
+            reply: None,
         }),
     );
     restarted.ctx.runners = Arc::new(restart_runners);
@@ -4040,6 +4051,7 @@ fn fake_runners_with_hook(
             wait_for_release: None,
             failure: None,
             resume_missing_once: None,
+            reply: None,
         }),
     );
     runners
@@ -4206,4 +4218,53 @@ fn lifts_leading_quote_line_from_backend_replies() {
     let (quote, rest) = super::lift_outbound_quote("> \nafter empty quote");
     assert!(quote.is_none());
     assert_eq!(rest, "> \nafter empty quote");
+}
+
+#[tokio::test]
+async fn backend_reply_leading_quote_line_is_lifted_into_the_reply_quote() {
+    let state_path = temp_state_path();
+    let sessions_dir = temp_path("backend-quote-sessions");
+    let assistant_dir = temp_path("backend-quote-assistant");
+    std::fs::create_dir_all(&assistant_dir).unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let config = test_config(
+        &state_path,
+        sessions_dir.to_str().unwrap(),
+        assistant_dir.to_str().unwrap(),
+    );
+    let mut gateway = Gateway::new(config).unwrap();
+    {
+        let mut runners = HashMap::new();
+        runners.insert(
+            AgentBackend::Codex,
+            Runner::Fake(FakeRunner {
+                backend: AgentBackend::Codex,
+                session_id: "fake-session".to_string(),
+                calls: calls.clone(),
+                before_return: None,
+                wait_for_release: None,
+                failure: None,
+                resume_missing_once: None,
+                reply: Some("> the frobnicator keeps timing out\nTry the cache path.".to_string()),
+            }),
+        );
+        gateway.ctx.runners = Arc::new(runners);
+    }
+    run_messages(
+        &mut gateway,
+        vec![message(1, "me@icloud.com", "", true, "hello")],
+    )
+    .await;
+
+    assert_eq!(
+        gateway.ctx.sent_replies.lock().unwrap().as_slice(),
+        [(
+            "me@icloud.com".to_string(),
+            "Try the cache path.\n\n-- sent by push".to_string()
+        )]
+    );
+
+    let _ = std::fs::remove_file(&state_path);
+    let _ = std::fs::remove_file(format!("{state_path}.db"));
+    let _ = std::fs::remove_file(format!("{state_path}.audit.jsonl"));
 }
