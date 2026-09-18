@@ -15,6 +15,7 @@ fn help_commands_print_usage_without_creating_files() {
             .args(args)
             .current_dir(&workdir)
             .env("HOME", &home)
+            .env_remove("PUSH_HOME")
             .output()
             .unwrap();
 
@@ -47,6 +48,7 @@ fn version_commands_print_version_without_creating_files() {
             .args(args)
             .current_dir(&workdir)
             .env("HOME", &home)
+            .env_remove("PUSH_HOME")
             .output()
             .unwrap();
 
@@ -73,6 +75,7 @@ fn init_without_path_creates_assistant_in_current_directory() {
         .arg("init")
         .current_dir(&workdir)
         .env("HOME", &home)
+        .env_remove("PUSH_HOME")
         .output()
         .unwrap();
 
@@ -156,6 +159,7 @@ fn init_without_path_creates_assistant_in_current_directory() {
     let run_output = Command::new(env!("CARGO_BIN_EXE_push"))
         .current_dir(&workdir)
         .env("HOME", &home)
+        .env_remove("PUSH_HOME")
         .output()
         .unwrap();
     assert!(!run_output.status.success());
@@ -177,6 +181,7 @@ fn init_expands_home_in_requested_path() {
         .args(["init", "~/chosen", "--config"])
         .arg(&config)
         .env("HOME", &home)
+        .env_remove("PUSH_HOME")
         .output()
         .unwrap();
 
@@ -206,6 +211,7 @@ fn run_without_default_config_reports_first_run_guidance() {
     let output = Command::new(env!("CARGO_BIN_EXE_push"))
         .current_dir(&root)
         .env("HOME", &home)
+        .env_remove("PUSH_HOME")
         .output()
         .unwrap();
 
@@ -233,6 +239,7 @@ fn run_reads_existing_default_config_from_home() {
     let output = Command::new(env!("CARGO_BIN_EXE_push"))
         .current_dir(&root)
         .env("HOME", &home)
+        .env_remove("PUSH_HOME")
         .output()
         .unwrap();
 
@@ -372,6 +379,7 @@ fn assert_missing_default_config_guidance(args: &[&str]) {
         .args(args)
         .current_dir(&root)
         .env("HOME", &home)
+        .env_remove("PUSH_HOME")
         .output()
         .unwrap();
 
