@@ -225,6 +225,12 @@ impl Channel {
         }
     }
 
+    /// Whether the channel renders `reply_parameters`-style reply quotes.
+    /// Quote lifting on other channels would silently drop the quoted line.
+    pub fn supports_reply_quotes(&self) -> bool {
+        matches!(self, Self::Telegram(_))
+    }
+
     pub async fn poll(&self, since: i64) -> Result<Vec<RawMessage>> {
         match self {
             Self::IMessage(channel) => ChannelContract::poll(channel, since).await,

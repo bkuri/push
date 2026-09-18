@@ -412,7 +412,11 @@ where
                 ctx.audit
                     .backend_completed(job.row_id, &job.thread, job.backend, &out.reply),
             );
-            let (reply_quote, reply_text) = super::lift_outbound_quote(&out.reply);
+            let (reply_quote, reply_text) = if ctx.channel.supports_reply_quotes() {
+                super::lift_outbound_quote(&out.reply)
+            } else {
+                (None, out.reply.clone())
+            };
             let outbound = match ctx.history.lock().unwrap().record_outbound(
                 job.inbound_id,
                 OutboundOrigin::Backend,

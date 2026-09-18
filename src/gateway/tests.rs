@@ -4220,8 +4220,8 @@ fn lifts_leading_quote_line_from_backend_replies() {
     assert_eq!(rest, "> \nafter empty quote");
 }
 
-#[tokio::test]
-async fn backend_reply_leading_quote_line_is_lifted_into_the_reply_quote() {
+#[tokio::test(flavor = "current_thread")]
+async fn imessage_reply_keeps_leading_blockquote_line() {
     let state_path = temp_state_path();
     let sessions_dir = temp_path("backend-quote-sessions");
     let assistant_dir = temp_path("backend-quote-assistant");
@@ -4256,15 +4256,73 @@ async fn backend_reply_leading_quote_line_is_lifted_into_the_reply_quote() {
     )
     .await;
 
+    // Non-Telegram channels do not render reply quotes, so the blockquote
+    // line must stay in the message text.
     assert_eq!(
         gateway.ctx.sent_replies.lock().unwrap().as_slice(),
         [(
             "me@icloud.com".to_string(),
-            "Try the cache path.\n\n-- sent by push".to_string()
+            "> the frobnicator keeps timing out\nTry the cache path.\n\n-- sent by push"
+                .to_string()
         )]
     );
 
     let _ = std::fs::remove_file(&state_path);
     let _ = std::fs::remove_file(format!("{state_path}.db"));
     let _ = std::fs::remove_file(format!("{state_path}.audit.jsonl"));
+    let _ = std::fs::remove_dir_all(sessions_dir);
+    let _ = std::fs::remove_dir_all(assistant_dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn telegram_backend_reply_leading_quote_line_is_lifted_into_the_reply_quote() {
+    let state_path = temp_state_path();
+    let sessions_dir = temp_path("backend-quote-telegram-sessions");
+    let assistant_dir = temp_path("backend-quote-telegram-assistant");
+    std::fs::create_dir_all(&assistant_dir).unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut cfg = test_config(
+        &state_path,
+        sessions_dir.to_str().unwrap(),
+        assistant_dir.to_str().unwrap(),
+    );
+    cfg.channel = "telegram".to_string();
+    cfg.self_handles.clear();
+    cfg.allow_from.clear();
+    cfg.telegram_bot_token = Some("secret".to_string());
+    cfg.telegram_allow_user_ids = vec![7];
+    let mut gateway = Gateway::new(cfg).unwrap();
+    {
+        let mut runners = HashMap::new();
+        runners.insert(
+            AgentBackend::Codex,
+            Runner::Fake(FakeRunner {
+                backend: AgentBackend::Codex,
+                session_id: "fake-session".to_string(),
+                calls: calls.clone(),
+                before_return: None,
+                wait_for_release: None,
+                failure: None,
+                resume_missing_once: None,
+                reply: Some("> the frobnicator keeps timing out\nTry the cache path.".to_string()),
+            }),
+        );
+        gateway.ctx.runners = Arc::new(runners);
+    }
+    gateway
+        .tick_fake(vec![telegram_message(1, 7, 7, false, "hello")])
+        .await;
+    gateway.queues.clear();
+    gateway.drain_workers().await;
+
+    assert_eq!(
+        gateway.ctx.sent_replies.lock().unwrap().as_slice(),
+        [("7".to_string(), "Try the cache path.".to_string())]
+    );
+
+    let _ = std::fs::remove_file(&state_path);
+    let _ = std::fs::remove_file(format!("{state_path}.db"));
+    let _ = std::fs::remove_file(format!("{state_path}.audit.jsonl"));
+    let _ = std::fs::remove_dir_all(sessions_dir);
+    let _ = std::fs::remove_dir_all(assistant_dir);
 }
