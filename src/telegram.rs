@@ -18,15 +18,15 @@ pub const TEXT_LIMIT: usize = 4096;
 const LONG_POLL_SECONDS: u64 = 25;
 const HTTP_TIMEOUT_SECONDS: u64 = LONG_POLL_SECONDS + 10;
 
-struct TransportResponse {
-    status: u16,
-    body: Value,
+pub(crate) struct TransportResponse {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
-type TransportFuture<'a> = Pin<Box<dyn Future<Output = Result<TransportResponse>> + Send + 'a>>;
+pub(crate) type TransportFuture<'a> = Pin<Box<dyn Future<Output = Result<TransportResponse>> + Send + 'a>>;
 type BytesFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>>;
 
-trait Transport: Send + Sync {
+pub(crate) trait Transport: Send + Sync {
     fn post<'a>(&'a self, token: &'a str, method: &'static str, body: Value)
         -> TransportFuture<'a>;
 
@@ -53,6 +53,28 @@ trait Transport: Send + Sync {
 
 struct ReqwestTransport {
     client: reqwest::Client,
+}
+
+/// Test builds resolve every post instantly so worker paths that await a
+/// channel call stay deterministic under paused-clock gateway tests.
+#[cfg(test)]
+struct NoopTransport;
+
+#[cfg(test)]
+impl Transport for NoopTransport {
+    fn post<'a>(
+        &'a self,
+        _token: &'a str,
+        _method: &'static str,
+        _body: Value,
+    ) -> TransportFuture<'a> {
+        Box::pin(async {
+            Ok(TransportResponse {
+                status: 200,
+                body: json!({"ok": true, "result": true}),
+            })
+        })
+    }
 }
 
 impl Transport for ReqwestTransport {
@@ -180,14 +202,23 @@ impl Telegram {
             token: Arc::from(token),
             allow_user_ids: Arc::new(allow_user_ids.into_iter().collect()),
             allow_chat_ids: Arc::new(allow_chat_ids.into_iter().collect()),
-            transport: Arc::new(ReqwestTransport {
-                client: reqwest::Client::new(),
-            }),
+            transport: {
+                #[cfg(test)]
+                {
+                    Arc::new(NoopTransport)
+                }
+                #[cfg(not(test))]
+                {
+                    Arc::new(ReqwestTransport {
+                        client: reqwest::Client::new(),
+                    })
+                }
+            },
         }
     }
 
     #[cfg(test)]
-    fn with_transport(
+    pub(crate) fn with_transport(
         token: String,
         allow_user_ids: Vec<i64>,
         allow_chat_ids: Vec<i64>,
@@ -332,6 +363,28 @@ impl Telegram {
         if !response.ok {
             bail!(
                 "Telegram sendChatAction returned HTTP {}",
+                transport_response.status
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn send_reaction(&self, target: &str, message_id: i64, emoji: &str) -> Result<()> {
+        let (chat, _) = split_target(target);
+        let payload = json!({
+            "chat_id": chat,
+            "message_id": message_id,
+            "reaction": [{ "type": "emoji", "emoji": emoji }],
+        });
+        let transport_response = self
+            .transport
+            .post(&self.token, "setMessageReaction", payload)
+            .await?;
+        let response: ApiResponse<Value> = serde_json::from_value(transport_response.body)
+            .map_err(|_| anyhow::anyhow!("Telegram setMessageReaction returned an invalid response"))?;
+        if !response.ok {
+            bail!(
+                "Telegram setMessageReaction returned HTTP {}",
                 transport_response.status
             );
         }
@@ -1430,6 +1483,43 @@ mod tests {
         assert_eq!(
             calls[2].1,
             json!({"chat_id": "7", "message_thread_id": 99, "action": "typing"})
+        );
+    }
+
+    #[tokio::test]
+    async fn send_reaction_posts_minimal_payload_without_thread_id() {
+        let fake = Arc::new(FakeTransport::with_responses(vec![
+            json!({"ok": true, "result": true}),
+            json!({
+                "ok": false,
+                "error_code": 400,
+                "description": "Bad Request: REACTION_INVALID"
+            }),
+        ]));
+        let telegram =
+            Telegram::with_transport("secret".to_string(), vec![7], vec![], fake.clone());
+
+        telegram.send_reaction("7:99", 555, "👀").await.unwrap();
+        // A rejected emoji surfaces as an error instead of failing silently.
+        assert!(telegram.send_reaction("7:99", 555, "✅").await.is_err());
+
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(calls[0].0, "setMessageReaction");
+        assert_eq!(
+            calls[0].1,
+            json!({
+                "chat_id": "7",
+                "message_id": 555,
+                "reaction": [{"type": "emoji", "emoji": "👀"}]
+            })
+        );
+        assert_eq!(
+            calls[1].1,
+            json!({
+                "chat_id": "7",
+                "message_id": 555,
+                "reaction": [{"type": "emoji", "emoji": "✅"}]
+            })
         );
     }
 

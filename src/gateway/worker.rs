@@ -23,6 +23,23 @@ use super::{audit, audit_schedule_events, complete_row, Ctx, Job, WorkerState};
 pub(super) const SESSION_SETUP_FAILURE: &str =
     "Push could not prepare this conversation. Check the local logs, then resend.";
 
+/// Ack-reaction ladder (owner-approved 2026-09-18): the bot's restricted
+/// emoji set allows 👀 👍 👎 but not ✅ ❌, so claimed/failed map to the
+/// closest allowed emoji. setMessageReaction replaces, so each send is a
+/// ladder step: 👀 claimed -> 👍 done / 👎 failed.
+const REACTION_CLAIMED: &str = "\u{1F440}"; // 👀
+const REACTION_DONE: &str = "\u{1F44D}"; // 👍
+const REACTION_FAILED: &str = "\u{1F44E}"; // 👎
+
+async fn react(ctx: &Ctx, job: &Job, emoji: &str) {
+    let Some(message_id) = job.telegram_reply_anchor else {
+        return;
+    };
+    if let Err(e) = ctx.channel.send_reaction(&job.target, message_id, emoji).await {
+        warn!("[{}] reaction update failed: {e}", job.thread);
+    }
+}
+
 /// Processes one thread's jobs strictly in order, exiting when the queue closes.
 pub(super) async fn run(
     ctx: Ctx,
@@ -261,6 +278,9 @@ where
         .as_ref()
         .map_or_else(Vec::new, |images| images.paths().to_vec());
 
+    // Backend claims the row: the run is about to start.
+    react(ctx, &job, REACTION_CLAIMED).await;
+
     let run = async {
         let mut session_id = session_id;
         let mut prompt = match conversation_prompt(ctx, &job, &composer, is_new) {
@@ -403,6 +423,7 @@ where
 
     match result {
         Some(Ok(out)) => {
+            react(ctx, &job, REACTION_DONE).await;
             info!(
                 "[{}] {} completed; reply_chars={}",
                 job.thread,
@@ -464,6 +485,7 @@ where
             );
         }
         Some(Err(RunError::Timeout)) => {
+            react(ctx, &job, REACTION_FAILED).await;
             warn!("[{}] {} run timed out", job.thread, runner.label());
             audit(
                 ctx,
@@ -489,6 +511,7 @@ where
             .await;
         }
         None => {
+            react(ctx, &job, REACTION_FAILED).await;
             warn!("[{}] {} run interrupted", job.thread, runner.label());
             audit(
                 ctx,
@@ -513,6 +536,7 @@ where
             .await;
         }
         Some(Err(RunError::Failed(msg) | RunError::SessionMissing(msg))) => {
+            react(ctx, &job, REACTION_FAILED).await;
             error!("[{}] {} error: {msg}", job.thread, runner.label());
             audit(
                 ctx,

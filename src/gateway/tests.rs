@@ -5228,3 +5228,186 @@ async fn edit_during_phase_two_joins_the_merged_batch() {
     assert!(calls[0].prompt.contains("second part"));
     assert!(!calls[0].prompt.contains("preamble typo"));
 }
+
+// ---- ack-reaction ladder (owner-approved 2026-09-18) ----
+//
+// The bot's restricted Telegram emoji set allows 👀 👍 👎 but rejects ✅ ❌,
+// so claimed/failed map to the closest allowed emoji.
+
+struct ReactionTransport {
+    calls: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+}
+
+impl crate::telegram::Transport for ReactionTransport {
+    fn post<'a>(
+        &'a self,
+        _token: &'a str,
+        method: &'static str,
+        body: serde_json::Value,
+    ) -> crate::telegram::TransportFuture<'a> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((method.to_string(), body));
+        Box::pin(async move {
+            Ok(crate::telegram::TransportResponse {
+                status: 200,
+                body: serde_json::json!({"ok": true, "result": true}),
+            })
+        })
+    }
+}
+
+fn reaction_emojis(transport: &ReactionTransport) -> Vec<String> {
+    transport
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(method, _)| method == "setMessageReaction")
+        .map(|(_, body)| {
+            body["reaction"][0]["emoji"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+fn reaction_job(anchor: Option<i64>) -> Job {
+    Job {
+        telegram_reply_anchor: anchor,
+        row_id: 10,
+        inbound_id: 1,
+        thread: "telegram:dm:622998231".to_string(),
+        target: "622998231".to_string(),
+        backend: AgentBackend::Pi,
+        text: "hello".to_string(),
+        reply_with_voice: false,
+        voice_attachment: None,
+        image_attachments: Vec::new(),
+        approval_origin: AnswerOrigin {
+            channel: "telegram".to_string(),
+            thread_key: "telegram:dm:622998231".to_string(),
+            sender_key: "622998231".to_string(),
+            chat_key: "622998231".to_string(),
+        },
+    }
+}
+
+fn reaction_ctx(
+    transport: Arc<ReactionTransport>,
+    failure: Option<String>,
+) -> (Ctx, Arc<Mutex<Vec<FakeRunCall>>>) {
+    let state_path = temp_state_path();
+    let store = Arc::new(Mutex::new(
+        Store::open_at(format!("{state_path}.db"), &state_path).unwrap(),
+    ));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut runners = HashMap::new();
+    runners.insert(
+        AgentBackend::Pi,
+        Runner::Fake(FakeRunner {
+            backend: AgentBackend::Pi,
+            session_id: "fake-session".to_string(),
+            calls: calls.clone(),
+            before_return: None,
+            wait_for_release: None,
+            failure,
+            resume_missing_once: None,
+        }),
+    );
+    let mut history = History::open(
+        temp_path("reaction-history").to_string_lossy().to_string(),
+    )
+    .unwrap();
+    let inbound_id = history
+        .record_inbound(
+            "telegram",
+            "telegram:dm:622998231",
+            "telegram:10",
+            "hello",
+            None,
+        )
+        .unwrap();
+    assert_eq!(inbound_id, 1);
+    let assistant_dir = temp_path("reaction-assistant");
+    std::fs::create_dir_all(&assistant_dir).unwrap();
+    let ack = Arc::new(Mutex::new(AckState::default()));
+    ack.lock().unwrap().in_flight.insert(10);
+    let ctx = Ctx {
+        telegram_reply_anchor: Arc::new(Mutex::new(None)),
+        cfg: test_config(
+            &temp_path("reaction-state").to_string_lossy(),
+            &temp_path("reaction-sessions").to_string_lossy(),
+            &assistant_dir.to_string_lossy(),
+        ),
+        store,
+        history: Arc::new(Mutex::new(history)),
+        ack,
+        runners: Arc::new(runners),
+        channel: Channel::Telegram(crate::telegram::Telegram::with_transport(
+            "secret".to_string(),
+            vec![],
+            vec![622998231],
+            transport,
+        )),
+        run_timeout: Duration::from_secs(5),
+        reply_marker: String::new(),
+        assistant_dir: assistant_dir.to_string_lossy().to_string(),
+        audit: Arc::new(AuditLog::new(
+            temp_path("reaction-audit").to_string_lossy().to_string(),
+            false,
+            "telegram",
+        )),
+        schedule_destination: None,
+        voice: None,
+        setup_failure_replies: Arc::new(Mutex::new(Vec::new())),
+        sent_replies: Arc::new(Mutex::new(Vec::new())),
+        sent_voice_replies: Arc::new(Mutex::new(Vec::new())),
+        send_failures_remaining: Arc::new(Mutex::new(0)),
+        send_failure_after: Arc::new(Mutex::new(None)),
+    };
+    (ctx, calls)
+}
+
+#[tokio::test]
+async fn telegram_ladder_claims_then_marks_done() {
+    let transport = Arc::new(ReactionTransport {
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    let (ctx, _calls) = reaction_ctx(transport.clone(), None);
+
+    handle(&ctx, reaction_job(Some(555))).await;
+
+    assert_eq!(reaction_emojis(&transport), ["👀", "👍"]);
+    // The reply itself still went out through the same channel.
+    assert_eq!(
+        ctx.sent_replies.lock().unwrap().as_slice(),
+        [("622998231".to_string(), "fake reply: hello".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn telegram_ladder_marks_failed_runs() {
+    let transport = Arc::new(ReactionTransport {
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    let (ctx, _calls) = reaction_ctx(transport.clone(), Some("boom".to_string()));
+
+    handle(&ctx, reaction_job(Some(555))).await;
+
+    assert_eq!(reaction_emojis(&transport), ["👀", "👎"]);
+}
+
+#[tokio::test]
+async fn telegram_ladder_skips_messages_without_a_reply_anchor() {
+    let transport = Arc::new(ReactionTransport {
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    let (ctx, _calls) = reaction_ctx(transport.clone(), None);
+
+    handle(&ctx, reaction_job(None)).await;
+
+    assert!(reaction_emojis(&transport).is_empty());
+}

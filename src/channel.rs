@@ -141,6 +141,12 @@ trait ChannelContract {
         Ok(())
     }
 
+    /// Best-effort reaction on the inbound message; one slot per message, so
+    /// each send replaces the prior emoji (a state ladder, not a log).
+    async fn send_reaction(&self, _target: &str, _message_id: i64, _emoji: &str) -> Result<()> {
+        Ok(())
+    }
+
     async fn download_voice(&self, voice: &InboundVoice) -> Result<AudioClip>;
     async fn send_voice(&self, target: &str, clip: &AudioClip) -> Result<()>;
     async fn download_image(&self, image: &InboundImage) -> Result<DownloadedImage>;
@@ -344,6 +350,20 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::send_typing(channel, target).await,
             Self::Telegram(channel) => ChannelContract::send_typing(channel, target).await,
             Self::Slack(channel) => ChannelContract::send_typing(channel, target).await,
+        }
+    }
+
+    pub async fn send_reaction(&self, target: &str, message_id: i64, emoji: &str) -> Result<()> {
+        match self {
+            Self::IMessage(channel) => {
+                ChannelContract::send_reaction(channel, target, message_id, emoji).await
+            }
+            Self::Telegram(channel) => {
+                ChannelContract::send_reaction(channel, target, message_id, emoji).await
+            }
+            Self::Slack(channel) => {
+                ChannelContract::send_reaction(channel, target, message_id, emoji).await
+            }
         }
     }
 
@@ -690,6 +710,10 @@ impl ChannelContract for Telegram {
 
     async fn send_typing(&self, target: &str) -> Result<()> {
         self.send_typing(target).await
+    }
+
+    async fn send_reaction(&self, target: &str, message_id: i64, emoji: &str) -> Result<()> {
+        self.send_reaction(target, message_id, emoji).await
     }
 
     async fn download_voice(&self, voice: &InboundVoice) -> Result<AudioClip> {
