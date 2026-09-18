@@ -602,10 +602,16 @@ impl Update {
             thread_id: message.message_thread_id,
             reply_to_message_id: message.message_id,
             reply_context: message
-                .reply_to_message
-                .as_deref()
-                .and_then(|replied| replied.text.as_deref().or(replied.caption.as_deref()))
-                .map(reply_excerpt),
+                .quote
+                .map(|quote| quote.text)
+                .or_else(|| {
+                    message
+                        .reply_to_message
+                        .as_deref()
+                        .and_then(|replied| replied.text.as_deref().or(replied.caption.as_deref()))
+                        .map(str::to_string)
+                })
+                .map(|text| reply_excerpt(&text)),
         }
     }
 }
@@ -641,7 +647,15 @@ struct TelegramMessage {
     #[serde(default)]
     message_thread_id: Option<i64>,
     #[serde(default)]
+    quote: Option<TextQuote>,
+    #[serde(default)]
     reply_to_message: Option<Box<TelegramMessage>>,
+}
+
+#[derive(Deserialize)]
+struct TextQuote {
+    #[serde(default)]
+    text: String,
 }
 
 #[derive(Deserialize)]
@@ -869,6 +883,34 @@ mod tests {
     }
 
     #[test]
+    fn selected_quote_takes_priority_over_replied_to_text() {
+        let update: Update = serde_json::from_value(json!({
+            "update_id": 10,
+            "message": {
+                "message_id": 21,
+                "from": {"id": 7},
+                "chat": {"id": 7, "type": "private"},
+                "text": "what about this part",
+                "quote": {"position": 12, "text": "the frobnicator keeps timing out"},
+                "reply_to_message": {
+                    "message_id": 20,
+                    "from": {"id": 99},
+                    "chat": {"id": 7, "type": "private"},
+                    "text": "long full message the user did not select"
+                }
+            }
+        }))
+        .unwrap();
+
+        let message = update.into_raw();
+
+        assert_eq!(
+            message.reply_context.as_deref(),
+            Some("the frobnicator keeps timing out")
+        );
+    }
+
+    #[test]
     fn parses_reply_to_message_into_flattened_excerpt() {
         let long = "word ".repeat(80).trim_end().to_string();
         let update: Update = serde_json::from_value(json!({
@@ -969,6 +1011,7 @@ mod tests {
                 voice: None,
                 message_thread_id: None,
                 message_id: Some(1),
+                quote: None,
                 reply_to_message: None,
             }),
         }
@@ -1002,6 +1045,7 @@ mod tests {
                 }),
                 message_thread_id: None,
                 message_id: Some(1),
+                quote: None,
                 reply_to_message: None,
             }),
         }
