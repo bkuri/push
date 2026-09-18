@@ -58,6 +58,13 @@ pub struct Config {
     /// Shell command run on run timeout; its stdout becomes the reply.
     #[serde(default)]
     pub timeout_hook: Option<String>,
+    /// Per-thread debounce window in seconds. Burst messages on one thread
+    /// merge into a single agent run. `0` disables debouncing.
+    #[serde(default)]
+    pub debounce_wait_secs: u64,
+    /// Upper bound on the total hold applied to one debounced batch.
+    #[serde(default = "default_max_debounce_secs")]
+    pub max_debounce_secs: u64,
     #[serde(default)]
     pub self_handles: Vec<String>,
     #[serde(default)]
@@ -600,6 +607,13 @@ impl Config {
         }
         self.poll_interval_dur()?;
         self.run_timeout_dur()?;
+        if self.debounce_wait_secs > 0 && self.max_debounce_secs < self.debounce_wait_secs {
+            bail!(
+                "max_debounce_secs ({}) must not be shorter than debounce_wait_secs ({})",
+                self.max_debounce_secs,
+                self.debounce_wait_secs
+            );
+        }
         Ok(())
     }
 }
@@ -924,6 +938,9 @@ fn default_poll_interval() -> String {
 fn default_run_timeout() -> String {
     "10m".to_string()
 }
+fn default_max_debounce_secs() -> u64 {
+    15
+}
 fn default_agent() -> String {
     "claude".to_string()
 }
@@ -959,6 +976,8 @@ mod tests {
             db_path: root.join("chat.db").to_string_lossy().to_string(),
             poll_interval: "1s".to_string(),
             run_timeout: "1s".to_string(),
+            debounce_wait_secs: 0,
+            max_debounce_secs: 15,
             self_handles: vec!["me@example.com".to_string()],
             allow_from: Vec::new(),
             telegram_bot_token: None,
@@ -1032,6 +1051,22 @@ mod tests {
             overridden.run_timeout_dur().unwrap(),
             Duration::from_secs(45)
         );
+    }
+
+    #[test]
+    fn debounce_defaults_off_and_validates_bounds() {
+        let default: Config = toml::from_str("agent = 'codex'").unwrap();
+        assert_eq!(default.debounce_wait_secs, 0);
+        assert_eq!(default.max_debounce_secs, 15);
+
+        let mut bad = config();
+        bad.debounce_wait_secs = 5;
+        bad.max_debounce_secs = 2;
+        assert!(bad
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("max_debounce_secs"));
     }
 
     #[test]

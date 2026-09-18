@@ -211,6 +211,8 @@ requests. Review [permissions and security](security.md) before enabling jobs.
 | `run_timeout` | `"10m"` | Maximum chat backend run time |
 | `timeout_reply` | hardcoded string | Overrides the default timeout reply text |
 | `timeout_hook` | none | Shell command run via `/bin/sh -c` on run timeout; stdout becomes the reply (env vars: `PUSH_THREAD`, `PUSH_ROW_ID`, `PUSH_BACKEND`, `PUSH_WORK_DIR`; 5s budget, warn and fall back on any failure) |
+| `debounce_wait_secs` | `0` | Per-thread debounce window (seconds); `0` disables. Burst messages on one thread merge into a single agent run |
+| `max_debounce_secs` | `15` | Upper bound on the total hold applied to one debounced batch |
 
 ### iMessage
 

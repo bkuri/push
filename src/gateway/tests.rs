@@ -4276,6 +4276,8 @@ fn test_config(state_path: &str, _sessions_dir: &str, assistant_dir: &str) -> Co
         db_path: "fake-chat.db".to_string(),
         poll_interval: "1s".to_string(),
         run_timeout: "1s".to_string(),
+        debounce_wait_secs: 0,
+        max_debounce_secs: 15,
         self_handles: vec!["me@icloud.com".to_string()],
         allow_from: vec!["+15551234567".to_string()],
         telegram_bot_token: None,
@@ -4905,4 +4907,155 @@ async fn telegram_backend_reply_leading_quote_line_is_lifted_into_the_reply_quot
     let _ = std::fs::remove_file(format!("{state_path}.audit.jsonl"));
     let _ = std::fs::remove_dir_all(sessions_dir);
     let _ = std::fs::remove_dir_all(assistant_dir);
+}
+
+#[tokio::test(start_paused = true)]
+async fn debounce_merges_burst_into_one_run() {
+    let state_path = temp_state_path();
+    let sessions_dir = temp_path("debounce-merge-sessions");
+    let assistant_dir = temp_path("debounce-merge-assistant");
+    std::fs::create_dir_all(&assistant_dir).unwrap();
+    let calls = Arc::new(Mutex::new(Vec::<FakeRunCall>::new()));
+    let mut cfg = test_config(
+        &state_path,
+        sessions_dir.to_str().unwrap(),
+        assistant_dir.to_str().unwrap(),
+    );
+    cfg.debounce_wait_secs = 1;
+    cfg.max_debounce_secs = 15;
+    let mut gateway = Gateway::new(cfg).unwrap();
+    gateway.ctx.runners = Arc::new(fake_runners(calls.clone()));
+
+    run_messages(
+        &mut gateway,
+        vec![
+            message(1, "+15551234567", "+15551234567", false, "first part"),
+            message(2, "+15551234567", "+15551234567", false, "second part"),
+        ],
+    )
+    .await;
+    assert_eq!(calls.lock().unwrap().len(), 0, "burst is held");
+
+    // t=2: phase 1 has elapsed, batch size 2 fixes the deadline at t=3.
+    tokio::time::advance(Duration::from_secs(2)).await;
+    run_messages(&mut gateway, vec![]).await;
+    assert_eq!(calls.lock().unwrap().len(), 0, "phase 2 still open");
+
+    // t=3: window closed; one merged run carries both texts.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    run_messages(&mut gateway, vec![]).await;
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].prompt.contains("first part"));
+    assert!(calls[0].prompt.contains("second part"));
+    drop(calls);
+    assert_eq!(gateway.store.lock().unwrap().cursor("imessage").unwrap(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn messages_joining_phase_two_merge_without_extending_the_window() {
+    let state_path = temp_state_path();
+    let sessions_dir = temp_path("debounce-phase2-sessions");
+    let assistant_dir = temp_path("debounce-phase2-assistant");
+    std::fs::create_dir_all(&assistant_dir).unwrap();
+    let calls = Arc::new(Mutex::new(Vec::<FakeRunCall>::new()));
+    let mut cfg = test_config(
+        &state_path,
+        sessions_dir.to_str().unwrap(),
+        assistant_dir.to_str().unwrap(),
+    );
+    cfg.debounce_wait_secs = 1;
+    cfg.max_debounce_secs = 15;
+    let mut gateway = Gateway::new(cfg).unwrap();
+    gateway.ctx.runners = Arc::new(fake_runners(calls.clone()));
+
+    run_messages(
+        &mut gateway,
+        vec![message(1, "+15551234567", "+15551234567", false, "part one")],
+    )
+    .await;
+    // t=1: phase 1 closes with one message; deadline fixed at t=2.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    run_messages(&mut gateway, vec![]).await;
+    assert_eq!(calls.lock().unwrap().len(), 0);
+
+    // t=1.5: a late message joins mid-phase-2.
+    tokio::time::advance(Duration::from_millis(500)).await;
+    run_messages(
+        &mut gateway,
+        vec![message(2, "+15551234567", "+15551234567", false, "part two")],
+    )
+    .await;
+    assert_eq!(calls.lock().unwrap().len(), 0, "late message still held");
+
+    // t=2: the original deadline fires — the late message did not extend it.
+    tokio::time::advance(Duration::from_millis(500)).await;
+    run_messages(&mut gateway, vec![]).await;
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].prompt.contains("part one"));
+    assert!(calls[0].prompt.contains("part two"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn stop_bypasses_debounce_and_flushes_the_held_batch() {
+    let state_path = temp_state_path();
+    let sessions_dir = temp_path("debounce-stop-sessions");
+    let assistant_dir = temp_path("debounce-stop-assistant");
+    std::fs::create_dir_all(&assistant_dir).unwrap();
+    let calls = Arc::new(Mutex::new(Vec::<FakeRunCall>::new()));
+    let mut cfg = test_config(
+        &state_path,
+        sessions_dir.to_str().unwrap(),
+        assistant_dir.to_str().unwrap(),
+    );
+    cfg.debounce_wait_secs = 30;
+    cfg.max_debounce_secs = 60;
+    let mut gateway = Gateway::new(cfg).unwrap();
+    gateway.ctx.runners = Arc::new(fake_runners(calls.clone()));
+
+    run_messages(
+        &mut gateway,
+        vec![message(1, "+15551234567", "+15551234567", false, "held work")],
+    )
+    .await;
+    assert!(gateway.ack.lock().unwrap().debouncing.contains(&1));
+
+    // /stop arrives well inside the (long) window: never held.
+    run_messages(
+        &mut gateway,
+        vec![message(2, "+15551234567", "+15551234567", false, "/stop")],
+    )
+    .await;
+    assert!(
+        gateway.ack.lock().unwrap().debouncing.is_empty(),
+        "held batch flushed by /stop"
+    );
+    assert!(gateway.debouncing.is_empty());
+}
+
+#[tokio::test]
+async fn debounce_disabled_by_default_routes_each_message_immediately() {
+    let state_path = temp_state_path();
+    let sessions_dir = temp_path("debounce-off-sessions");
+    let assistant_dir = temp_path("debounce-off-assistant");
+    std::fs::create_dir_all(&assistant_dir).unwrap();
+    let calls = Arc::new(Mutex::new(Vec::<FakeRunCall>::new()));
+    let mut gateway = Gateway::new(test_config(
+        &state_path,
+        sessions_dir.to_str().unwrap(),
+        assistant_dir.to_str().unwrap(),
+    ))
+    .unwrap();
+    gateway.ctx.runners = Arc::new(fake_runners(calls.clone()));
+
+    run_messages(
+        &mut gateway,
+        vec![
+            message(1, "+15551234567", "+15551234567", false, "one"),
+            message(2, "+15551234567", "+15551234567", false, "two"),
+        ],
+    )
+    .await;
+    assert_eq!(calls.lock().unwrap().len(), 2);
 }

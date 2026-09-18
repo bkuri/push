@@ -82,6 +82,9 @@ pub struct Gateway {
     ctx: Ctx,
     cfg: Config,
     poll_interval: Duration,
+    debounce_wait: Duration,
+    max_debounce: Duration,
+    debouncing: HashMap<String, DebouncedBatch>,
     queues: HashMap<String, WorkerQueue>,
     handles: Vec<JoinHandle<()>>,
 }
@@ -102,8 +105,17 @@ pub struct PrimaryDestination {
 struct AckState {
     in_flight: BTreeSet<i64>,
     deferred: BTreeSet<i64>,
+    debouncing: BTreeSet<i64>,
     persisting: BTreeSet<i64>,
     completed: BTreeSet<i64>,
+}
+
+/// Jobs for one thread held while a debounce window is open.
+struct DebouncedBatch {
+    first_arrival: tokio::time::Instant,
+    /// Fixed once phase 1 elapses: `first_arrival + min(wait + wait * n, max)`.
+    deadline: Option<tokio::time::Instant>,
+    jobs: Vec<Job>,
 }
 
 struct WorkerQueue {
@@ -433,6 +445,8 @@ impl Gateway {
             send_failure_after: Arc::new(Mutex::new(None)),
         };
         let poll_interval = cfg.poll_interval_dur()?;
+        let debounce_wait = Duration::from_secs(cfg.debounce_wait_secs);
+        let max_debounce = Duration::from_secs(cfg.max_debounce_secs);
         Ok(Self {
             channel,
             store,
@@ -440,6 +454,9 @@ impl Gateway {
             ctx,
             cfg,
             poll_interval,
+            debounce_wait,
+            max_debounce,
+            debouncing: HashMap::new(),
             queues: HashMap::new(),
             handles: Vec::new(),
         })
@@ -592,6 +609,7 @@ impl Gateway {
         self.recover_closed_workers();
         retry_completion_persistence(&self.store, &self.ack, self.channel.id());
         persist_cursor(&self.store, &self.ack, self.channel.id());
+        self.flush_debounced().await;
         let mut since = match self.store.lock().unwrap().cursor(self.channel.id()) {
             Ok(cursor) => cursor,
             Err(error) => {
@@ -902,7 +920,7 @@ impl Gateway {
                 let job = Job {
                     row_id: m.row_id,
                     inbound_id,
-                    thread,
+                    thread: thread.clone(),
                     target,
                     backend,
                     text: match &m.reply_context {
@@ -916,11 +934,24 @@ impl Gateway {
                     telegram_reply_anchor: m.reply_to_message_id,
                 };
                 if is_stop {
+                    // Safety command: never held. Flush the thread's batch
+                    // first so the queued work is stoppable in arrival order.
+                    self.flush_debounced_thread(&thread).await;
                     if !self.stop(job).await {
                         return;
                     }
                     continue;
                 }
+                if self.debounce_wait > Duration::ZERO
+                    && job.image_attachments.is_empty()
+                    && job.voice_attachment.is_none()
+                {
+                    self.hold_for_debounce(job);
+                    continue;
+                }
+                // Voice replies and attachments bypass debouncing; flush the
+                // thread's held batch first so arrival order is preserved.
+                self.flush_debounced_thread(&thread).await;
                 if !self.route(job).await {
                     return;
                 }
@@ -1084,6 +1115,97 @@ impl Gateway {
             ),
         ));
         self.spawn_worker(thread.to_string(), pending);
+    }
+
+    /// Holds a plain-text job for its thread's debounce window. The row is
+    /// already persisted (`record_inbound` runs before dispatch); marking it
+    /// `debouncing` keeps the poll cursor behind the batch so a crash
+    /// mid-debounce re-delivers it instead of losing it.
+    fn hold_for_debounce(&mut self, job: Job) {
+        let row_id = job.row_id;
+        let thread = job.thread.clone();
+        self.ack.lock().unwrap().debouncing.insert(row_id);
+        let now = tokio::time::Instant::now();
+        let batch = self
+            .debouncing
+            .entry(thread.clone())
+            .or_insert_with(|| DebouncedBatch {
+                first_arrival: now,
+                deadline: None,
+                jobs: Vec::new(),
+            });
+        batch.jobs.push(job);
+        info!(
+            "[{thread}] holding message for debounce ({} queued)",
+            batch.jobs.len()
+        );
+    }
+
+    /// Routes held batches whose debounce window has closed. Two-phase
+    /// proportional: after `debounce_wait` the batch size `n` is fixed once,
+    /// then the window extends by `debounce_wait * n`, clamped so the total
+    /// hold never exceeds `max_debounce`. Messages joining during the second
+    /// phase merge into the batch without extending it.
+    async fn flush_debounced(&mut self) {
+        if self.debouncing.is_empty() {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        let ready = self
+            .debouncing
+            .iter_mut()
+            .filter_map(|(thread, batch)| {
+                if batch.deadline.is_none() && now >= batch.first_arrival + self.debounce_wait {
+                    let total = self.debounce_wait * (1 + batch.jobs.len() as u32);
+                    batch.deadline = Some(batch.first_arrival + total.min(self.max_debounce));
+                }
+                batch
+                    .deadline
+                    .is_some_and(|deadline| now >= deadline)
+                    .then(|| thread.clone())
+            })
+            .collect::<Vec<_>>();
+        for thread in ready {
+            self.flush_debounced_thread(&thread).await;
+        }
+    }
+
+    /// Merges one thread's held batch into a single job and routes it. The
+    /// first job anchors the merged run; the remaining rows complete as
+    /// `debounce_merged` so the cursor can advance behind the anchor row.
+    async fn flush_debounced_thread(&mut self, thread: &str) {
+        let Some(mut batch) = self.debouncing.remove(thread) else {
+            return;
+        };
+        let mut jobs = std::mem::take(&mut batch.jobs);
+        let Some(mut merged) = jobs.first().cloned() else {
+            return;
+        };
+        let extras = jobs.split_off(1);
+        for extra in &extras {
+            merged.text.push_str("\n\n");
+            merged.text.push_str(&extra.text);
+        }
+        {
+            let mut ack = self.ack.lock().unwrap();
+            ack.debouncing.remove(&merged.row_id);
+            for extra in &extras {
+                ack.debouncing.remove(&extra.row_id);
+            }
+        }
+        for extra in &extras {
+            self.complete_row(extra.row_id, "debounce_merged");
+        }
+        if !extras.is_empty() {
+            info!(
+                "[{thread}] debounce window closed; merged {} messages into row {}",
+                extras.len() + 1,
+                merged.row_id
+            );
+        }
+        if !self.route(merged).await {
+            warn!("[{thread}] merged debounce batch routing failed; row will retry");
+        }
     }
 
     async fn stop(&mut self, job: Job) -> bool {
@@ -1439,6 +1561,7 @@ fn runners(cfg: &Config) -> HashMap<AgentBackend, Runner> {
 impl AckState {
     fn is_known(&self, row_id: i64) -> bool {
         self.in_flight.contains(&row_id)
+            || self.debouncing.contains(&row_id)
             || self.persisting.contains(&row_id)
             || self.completed.contains(&row_id)
     }
@@ -1449,6 +1572,7 @@ impl AckState {
             .first()
             .into_iter()
             .chain(self.deferred.first())
+            .chain(self.debouncing.first())
             .chain(self.persisting.first())
             .copied()
             .min()

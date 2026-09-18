@@ -52,6 +52,8 @@ pub fn test_config() -> crate::config::Config {
         db_path: "/fake/chat.db".to_string(),
         poll_interval: "1s".to_string(),
         run_timeout: "1s".to_string(),
+        debounce_wait_secs: 0,
+        max_debounce_secs: 15,
         self_handles: vec!["me@icloud.com".to_string()],
         allow_from: Vec::new(),
         telegram_bot_token: None,
