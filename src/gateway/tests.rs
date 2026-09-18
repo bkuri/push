@@ -4423,6 +4423,7 @@ async fn run_to_timeout(
             wait_for_release: Some(Arc::new(tokio::sync::Notify::new())),
             failure: None,
             resume_missing_once: None,
+            reply: None,
         }),
     );
     gateway.ctx.runners = Arc::new(runners);

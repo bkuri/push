@@ -1177,16 +1177,6 @@ async fn run_command_hook(hook: &str, args: &str, env: CommandHookEnv) -> String
 const COMMAND_HOOK_TIMEOUT_SECS: u64 = 15;
 const COMMAND_HOOK_MAX_STDOUT: usize = 64 * 1024; // same cap the timeout hook applies
 
-/// SIGKILLs the hook's whole process group (negative pid). Covers the shell
-/// leader and any backgrounded descendants — kill_on_drop only ever signals
-/// the leader. Errors are ignored: the group may already be gone.
-fn kill_hook_group(pgid: libc::pid_t) {
-    // Safety: signal syscall with an integer pid; no pointers involved.
-    unsafe {
-        libc::kill(-pgid, libc::SIGKILL);
-    }
-}
-
 /// Reads a pipe with a byte cap, returning the bytes, whether the cap was
 /// exceeded, and the first read error (if any). A read error is not EOF:
 /// partial output from a failing pipe is a hook failure.
