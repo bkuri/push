@@ -4438,6 +4438,7 @@ async fn run_to_timeout(
             wait_for_release: Some(Arc::new(tokio::sync::Notify::new())),
             failure: None,
             resume_missing_once: None,
+            reply: None,
         }),
     );
     gateway.ctx.runners = Arc::new(runners);
@@ -5315,6 +5316,7 @@ fn reaction_ctx(
             wait_for_release: None,
             failure,
             resume_missing_once: None,
+            reply: None,
         }),
     );
     let mut history = History::open(
@@ -5336,7 +5338,6 @@ fn reaction_ctx(
     let ack = Arc::new(Mutex::new(AckState::default()));
     ack.lock().unwrap().in_flight.insert(10);
     let ctx = Ctx {
-        telegram_reply_anchor: Arc::new(Mutex::new(None)),
         cfg: test_config(
             &temp_path("reaction-state").to_string_lossy(),
             &temp_path("reaction-sessions").to_string_lossy(),
