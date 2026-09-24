@@ -70,7 +70,7 @@ where
         report_delivery(
             ctx,
             &job,
-            deliver_stored(ctx, &job, &outbound).await,
+            deliver_stored(ctx, &job, &outbound, None).await,
             &outbound.content,
             "recovered_outbound",
             "recover outbound",
@@ -414,11 +414,16 @@ where
                 ctx.audit
                     .backend_completed(job.row_id, &job.thread, job.backend, &out.reply),
             );
+            let (reply_quote, reply_text) = if ctx.channel.supports_reply_quotes() {
+                super::lift_outbound_quote(&out.reply)
+            } else {
+                (None, out.reply.clone())
+            };
             let outbound = match ctx.history.lock().unwrap().record_outbound(
                 job.inbound_id,
                 OutboundOrigin::Backend,
                 Some(job.backend.as_str()),
-                &out.reply,
+                &reply_text,
             ) {
                 Ok(outbound) => outbound,
                 Err(error) => {
@@ -445,7 +450,7 @@ where
                 );
                 return;
             }
-            let delivery = deliver_stored(ctx, &job, &outbound).await;
+            let delivery = deliver_stored(ctx, &job, &outbound, reply_quote.as_deref()).await;
             if delivery.is_ok() {
                 info!("[{}] reply sent via {}", job.thread, ctx.channel.id());
             }
@@ -453,7 +458,7 @@ where
                 ctx,
                 &job,
                 delivery,
-                &out.reply,
+                &reply_text,
                 "completed",
                 "deliver backend reply",
             );
@@ -578,8 +583,13 @@ async fn review_changed_schedules(ctx: &Ctx, job: &Job) {
     };
     audit_schedule_events(ctx, &mut ledger);
     for question in questions {
-        let delivered =
-            super::reply_to(ctx, &question.target, &question.render_correlated_text()).await;
+        let delivered = super::reply_to(
+            ctx,
+            &question.target,
+            &question.render_correlated_text(),
+            None,
+        )
+        .await;
         if let Err(error) = ledger.mark_schedule_question_delivery(
             &question.id,
             if delivered {
@@ -854,7 +864,7 @@ async fn finish_run_with_gateway_reply(ctx: &Ctx, job: &Job, reply: &str, labels
     report_delivery(
         ctx,
         job,
-        deliver_stored(ctx, job, &outbound).await,
+        deliver_stored(ctx, job, &outbound, None).await,
         reply,
         labels.completion,
         labels.deliver,
@@ -1226,13 +1236,14 @@ pub(super) async fn record_and_deliver(
     origin: OutboundOrigin,
     text: &str,
 ) -> Result<DeliveryOutcome> {
+    let (quote, text) = super::lift_outbound_quote(text);
     let outbound = ctx.history.lock().unwrap().record_outbound(
         job.inbound_id,
         origin,
         Some(job.backend.as_str()),
-        text,
+        &text,
     )?;
-    deliver_stored(ctx, job, &outbound).await
+    deliver_stored(ctx, job, &outbound, quote.as_deref()).await
 }
 
 /// Records an outbound reply and tries delivery once. Control-path replies use
@@ -1252,7 +1263,14 @@ pub(super) async fn record_and_deliver_once(
     if outbound.status == DeliveryStatus::Delivered {
         return Ok(true);
     }
-    let delivered = deliver_outbound_once(ctx, &job.target, &mut outbound).await?;
+    let delivered = deliver_outbound_once(
+        ctx,
+        &job.target,
+        job.telegram_reply_anchor,
+        None,
+        &mut outbound,
+    )
+    .await?;
     ctx.history.lock().unwrap().mark_delivery(
         outbound.id,
         if delivered {
@@ -1268,6 +1286,7 @@ async fn deliver_stored(
     ctx: &Ctx,
     job: &Job,
     outbound: &OutboundMessage,
+    quote: Option<&str>,
 ) -> Result<DeliveryOutcome> {
     if outbound.status == DeliveryStatus::Delivered {
         return Ok(DeliveryOutcome::AlreadyDelivered);
@@ -1277,7 +1296,14 @@ async fn deliver_stored(
     let mut attempt = 0;
     loop {
         attempt += 1;
-        let delivered = deliver_outbound_once(ctx, &job.target, &mut outbound).await?;
+        let delivered = deliver_outbound_once(
+            ctx,
+            &job.target,
+            job.telegram_reply_anchor,
+            quote,
+            &mut outbound,
+        )
+        .await?;
         let status = if delivered {
             DeliveryStatus::Delivered
         } else {
@@ -1322,6 +1348,8 @@ async fn deliver_stored(
 async fn deliver_outbound_once(
     ctx: &Ctx,
     target: &str,
+    reply_anchor: Option<i64>,
+    quote: Option<&str>,
     outbound: &mut OutboundMessage,
 ) -> Result<bool> {
     let chunks = ctx
@@ -1340,7 +1368,7 @@ async fn deliver_outbound_once(
         .enumerate()
         .skip(outbound.delivery_chunk_index)
     {
-        if let Err(error) = super::send_reply_chunk(ctx, target, chunk).await {
+        if let Err(error) = super::send_reply_chunk(ctx, target, reply_anchor, quote, chunk).await {
             error!(
                 "outbound {} chunk {index} send error to {target}: {error}",
                 outbound.id
